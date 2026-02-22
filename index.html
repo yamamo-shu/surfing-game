@@ -233,6 +233,7 @@ let _prevCanCatch    = false;   // 前フレームの _canCatch（リセット�
 let catchTapCount    = 0;       // 波乗り連打カウント
 let catchTapRequired = 2;       // 必要タップ数（波サイズで決まる: Lv1=2〜Lv10=10）
 let _spaceBtn    = null;    // 現フレームのSpaceボタン領域 {x,y,w,h,label,color}
+let _backBtn     = null;    // 現フレームの「戻る」ボタン領域
 const _touchMap  = new Map(); // touchId → 'drag' | key | null
 const _touchPos  = new Map(); // touchId → {x, y}  ドラッグ追跡
 let _dragDirKey  = null;      // 現在アクティブなドラッグ方向キー
@@ -247,6 +248,13 @@ function _onTouchStart(e) {
     e.preventDefault();
     for (const t of e.changedTouches) {
         const sx = t.clientX, sy = t.clientY; // スクリーン座標
+
+        // 「戻る」ボタン（SPOT_SELECT 以外で表示）
+        if (gameState !== STATES.SPOT_SELECT && _inRect(_backBtn, sx, sy)) {
+            gameState = STATES.SPOT_SELECT;
+            _touchMap.set(t.identifier, null);
+            continue;
+        }
 
         // SCORE_DISPLAY: 3秒ロック解除後にタップで続行
         if (gameState === STATES.SCORE_DISPLAY) {
@@ -1051,26 +1059,63 @@ function drawTouchUI() {
         btn = { x: bx, y: height - beachHeight - bh - 16, w: bw, h: bh,
                 label: 'パドルアウト！', color: '#2288CC' };
     } else if (gameState === STATES.WAITING && _canCatch) {
-        const remaining = catchTapRequired - catchTapCount;
-        btn = { x: bx, y: height * 0.70, w: bw, h: bh,
-                label: `CATCH!  あと${remaining}回`, color: '#FF8800' };
-        _spaceBtn = btn; // 先に設定してドット描画で使う
-        // タップ進捗ドット
+        // ── Catch the Wave 大型連打UI ──
         ctx.save();
-        const dotR = Math.max(7, Math.min(10, bw * 0.038));
-        const dotY = btn.y - dotR * 2.8;
-        const dotSpan = dotR * 2.6;
-        const dotsW = (catchTapRequired - 1) * dotSpan + dotR * 2;
-        const dotsX = width / 2 - dotsW / 2 + dotR;
+        const now2   = Date.now();
+        const pulse2 = 1 + 0.07 * Math.sin(now2 / 120); // 速めのパルス
+
+        // 半透明パネル背景
+        const panelH = Math.min(220, height * 0.38);
+        const panelY = height / 2 - panelH / 2;
+        ctx.fillStyle = 'rgba(0,20,60,0.72)';
+        ctx.beginPath(); ctx.roundRect(bx - 10, panelY, bw + 20, panelH, 18); ctx.fill();
+        ctx.strokeStyle = '#FF8800'; ctx.lineWidth = 2;
+        ctx.shadowColor = '#FF8800'; ctx.shadowBlur = 12;
+        ctx.stroke(); ctx.shadowBlur = 0;
+
+        // "Catch the Wave！" タイトル
+        const titleFS = Math.round(Math.min(30, bw * 0.125) * pulse2);
+        ctx.font = `bold italic ${titleFS}px 'Courier New'`;
+        ctx.fillStyle = '#FF8800';
+        ctx.shadowColor = '#FF8800'; ctx.shadowBlur = 18;
+        ctx.textAlign = 'center';
+        ctx.fillText('Catch the Wave！', width / 2, panelY + titleFS * 1.4);
+        ctx.shadowBlur = 0;
+
+        // 残タップ数（巨大・目立つ）
+        const remaining = catchTapRequired - catchTapCount;
+        const numFS     = Math.min(88, Math.round(bw * 0.36 * pulse2));
+        ctx.font      = `bold ${numFS}px 'Courier New'`;
+        ctx.fillStyle = remaining <= 2 ? '#FF4444' : remaining <= 4 ? '#F4D03F' : '#FFFFFF';
+        ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = 24;
+        ctx.fillText(`${remaining}`, width / 2, panelY + titleFS * 1.4 + numFS * 1.05);
+        ctx.shadowBlur = 0;
+
+        // "回タップ！" サブテキスト
+        const subFS = Math.min(16, bw * 0.065);
+        ctx.font = `bold ${subFS}px 'Courier New'`;
+        ctx.fillStyle = 'rgba(255,255,255,0.80)';
+        ctx.fillText('回　タップ！', width / 2, panelY + titleFS * 1.4 + numFS * 1.05 + subFS * 1.5);
+
+        // 進捗ドット
+        const dotR   = Math.max(6, Math.min(10, bw * 0.036));
+        const dotSpan = dotR * 2.8;
+        const dotsX  = width / 2 - ((catchTapRequired - 1) * dotSpan) / 2;
+        const dotY2  = panelY + panelH - dotR * 2.2;
         for (let d = 0; d < catchTapRequired; d++) {
             ctx.beginPath();
-            ctx.arc(dotsX + d * dotSpan, dotY, dotR, 0, Math.PI * 2);
-            ctx.fillStyle = d < catchTapCount ? '#FF8800' : 'rgba(255,255,255,0.25)';
+            ctx.arc(dotsX + d * dotSpan, dotY2, dotR, 0, Math.PI * 2);
+            ctx.fillStyle   = d < catchTapCount ? '#FF8800' : 'rgba(255,255,255,0.20)';
+            ctx.shadowColor = d < catchTapCount ? '#FFAA44' : 'transparent';
+            ctx.shadowBlur  = d < catchTapCount ? 8 : 0;
             ctx.fill();
-            ctx.strokeStyle = d < catchTapCount ? '#FFAA44' : 'rgba(255,255,255,0.4)';
+            ctx.strokeStyle = d < catchTapCount ? '#FFAA44' : 'rgba(255,255,255,0.35)';
             ctx.lineWidth = 1.5; ctx.stroke();
         }
+        ctx.shadowBlur = 0;
         ctx.restore();
+
+        // _spaceBtn は画面全体（どこでもタップ有効）なので null のままでOK
     }
 
     if (btn) {
@@ -1093,6 +1138,26 @@ function drawTouchUI() {
         ctx.shadowColor = 'rgba(0,0,0,0.8)'; ctx.shadowBlur = 8;
         ctx.fillText(btn.label, btn.x + btn.w / 2, btn.y + btn.h * 0.62);
         ctx.shadowBlur = 0;
+        ctx.restore();
+    }
+
+    // ── 戻るボタン（左下・SPOT_SELECT 以外で常時表示）──
+    _backBtn = null;
+    if (gameState !== STATES.SPOT_SELECT) {
+        const bbW = Math.max(64, Math.min(88, width * 0.18));
+        const bbH = Math.max(34, Math.min(44, height * 0.058));
+        const bbX = 12;
+        const bbY = height - beachHeight - bbH - 10;
+        _backBtn  = { x: bbX, y: bbY, w: bbW, h: bbH };
+        ctx.save();
+        ctx.fillStyle   = 'rgba(0,0,0,0.55)';
+        ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+        ctx.lineWidth   = 1.5;
+        ctx.beginPath(); ctx.roundRect(bbX, bbY, bbW, bbH, 8); ctx.fill(); ctx.stroke();
+        ctx.fillStyle   = 'rgba(255,255,255,0.75)';
+        ctx.font        = `bold ${Math.max(12, Math.min(15, bbH * 0.40))}px 'Courier New'`;
+        ctx.textAlign   = 'center';
+        ctx.fillText('◀ 戻る', bbX + bbW / 2, bbY + bbH * 0.66);
         ctx.restore();
     }
 }
@@ -1540,8 +1605,8 @@ function draw() {
     if (gameState === STATES.BEACH) {
         ctx.textAlign = 'center';
         ctx.fillStyle = 'rgba(255,255,255,0.75)';
-        ctx.font      = '16px Courier New';
-        ctx.fillText('← → ポジションを決める   SPACE でパドルアウト！', width / 2, height - beachHeight - 70);
+        ctx.font      = '15px Courier New';
+        ctx.fillText('左右スワイプでポジション決め', width / 2, height - beachHeight - 70);
     }
 
     // GET_OUT ダックダイブ説明
@@ -1549,7 +1614,7 @@ function draw() {
         ctx.textAlign = 'center';
         ctx.fillStyle = 'rgba(255,255,255,0.65)';
         ctx.font      = '14px Courier New';
-        ctx.fillText('↑ ダックダイブ   ← → 左右   ↓ 後退', width / 2, height - beachHeight - 70);
+        ctx.fillText('ダブルタップ = ダックダイブ   左右スワイプで移動', width / 2, height - beachHeight - 70);
     }
 
     // CTW 系 UI

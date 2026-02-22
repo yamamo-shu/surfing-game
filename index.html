@@ -228,7 +228,10 @@ window.addEventListener('keydown', (e) => {
 window.addEventListener('keyup',   (e) => { keys[e.code] = false; });
 
 // ─── スマホ タッチ サポート ──────────────────────────────────
-let _canCatch    = false;   // WAITINGでのテイクオフ可能フラグ（タッチUI用）
+let _canCatch        = false;   // WAITINGでのテイクオフ可能フラグ（タッチUI用）
+let _prevCanCatch    = false;   // 前フレームの _canCatch（リセット検出用）
+let catchTapCount    = 0;       // 波乗り連打カウント
+let catchTapRequired = 2;       // 必要タップ数（波サイズで決まる: Lv1=2〜Lv10=10）
 let _spaceBtn    = null;    // 現フレームのSpaceボタン領域 {x,y,w,h,label,color}
 const _touchMap  = new Map(); // touchId → 'drag' | key | null
 const _touchPos  = new Map(); // touchId → {x, y}  ドラッグ追跡
@@ -260,19 +263,13 @@ function _onTouchStart(e) {
 
         if (isDouble) {
             if (gameState === STATES.GET_OUT) {
-                // ダックダイブ
+                // ダックダイブ（GET_OUTのみ）
                 keysJustPressed.add('ArrowUp');
                 _touchMap.set(t.identifier, null);
                 _lastTapTime = 0; // リセットして3連タップ防止
                 continue;
             }
-            if (gameState === STATES.WAITING && _canCatch) {
-                // 波に乗る
-                keysJustPressed.add('Space');
-                _touchMap.set(t.identifier, null);
-                _lastTapTime = 0;
-                continue;
-            }
+            // WAITING の波乗りはダブルタップ不要（連打方式に変更）
         }
 
         // PADDLING_TRY: 左右の判定円を直接タップ
@@ -800,7 +797,7 @@ function drawSpotSelect() {
     ctx.fillStyle = `rgba(255,255,255,${alpha.toFixed(2)})`;
     ctx.font = `${Math.max(12, Math.min(15, width * 0.034))}px 'Courier New'`;
     ctx.textAlign = 'center';
-    ctx.fillText('← → でスポット変更', width / 2, height - beachHeight - 45);
+    ctx.fillText('← → スワイプでスポット変更 / タップでスタート', width / 2, height - beachHeight - 45);
 
     // タッチUI（スタートボタン）
     drawTouchUI();
@@ -882,8 +879,23 @@ function update() {
                     && surferY >= activeWave.breakY
                     && surferY <  activeWave.bottomY;
         }
+        // 波が乗れる範囲に入った瞬間にカウンターをリセット＆必要タップ数を決定
+        if (canCatch && !_prevCanCatch) {
+            catchTapCount = 0;
+            const lv = activeWave ? activeWave.sizeLevel : 1;
+            catchTapRequired = Math.round(2 + (lv - 1) * 8 / 9); // Lv1=2〜Lv10=10
+        }
+        _prevCanCatch = canCatch;
         _canCatch = canCatch; // スマホUIへ公開
-        if (keysJustPressed.has('Space') && canCatch) startCatchTheWave();
+
+        // Space タップ→カウント増加→必要数に達したらCTW開始
+        if (keysJustPressed.has('Space') && canCatch) {
+            catchTapCount++;
+            if (catchTapCount >= catchTapRequired) {
+                catchTapCount = 0;
+                startCatchTheWave();
+            }
+        }
 
     } else if (gameState === STATES.CATCH_THE_WAVE) {
         _canCatch = false;
@@ -997,16 +1009,23 @@ function drawTouchUI() {
         const hintFS = Math.max(11, Math.min(14, width * 0.030));
         ctx.font = `${hintFS}px Courier New`;
         ctx.fillStyle = 'rgba(255,255,255,0.14)';
-        ctx.textAlign = 'center';
         // 左右スワイプヒント（両サイド端）
         ctx.textAlign = 'left';
         ctx.fillText('◀ swipe', 10, height / 2);
         ctx.textAlign = 'right';
         ctx.fillText('swipe ▶', width - 10, height / 2);
-        // ダブルタップヒント（GET_OUT/WAITINGのみ）
-        if (gameState === STATES.GET_OUT || gameState === STATES.WAITING) {
-            ctx.textAlign = 'center';
-            ctx.fillText('double tap = dive', width / 2, height * 0.10);
+        ctx.textAlign = 'center';
+        // 上下スワイプヒント
+        if (gameState === STATES.WAITING) {
+            ctx.fillText('▲ swipe 前進', width / 2, height * 0.10);
+            ctx.fillText('▼ swipe 後退', width / 2, height * 0.93);
+        } else if (gameState === STATES.GET_OUT) {
+            ctx.fillText('double tap = ダックダイブ', width / 2, height * 0.10);
+            ctx.fillText('▼ swipe 後退', width / 2, height * 0.93);
+        } else if (gameState === STATES.BEACH) {
+            // ビーチでは上下ヒント不要
+        } else if (gameState === STATES.RIDING) {
+            ctx.fillText('▼ swipe でキック', width / 2, height * 0.93);
         }
         ctx.restore();
     }
@@ -1024,12 +1043,30 @@ function drawTouchUI() {
         btn = { x: bx, y: height - beachHeight - bh - 16, w: bw, h: bh,
                 label: 'パドルアウト！', color: '#2288CC' };
     } else if (gameState === STATES.WAITING && _canCatch) {
+        const remaining = catchTapRequired - catchTapCount;
         btn = { x: bx, y: height * 0.70, w: bw, h: bh,
-                label: '乗る！  CATCH!', color: '#FF8800' };
+                label: `CATCH!  あと${remaining}回`, color: '#FF8800' };
+        _spaceBtn = btn; // 先に設定してドット描画で使う
+        // タップ進捗ドット
+        ctx.save();
+        const dotR = Math.max(7, Math.min(10, bw * 0.038));
+        const dotY = btn.y - dotR * 2.8;
+        const dotSpan = dotR * 2.6;
+        const dotsW = (catchTapRequired - 1) * dotSpan + dotR * 2;
+        const dotsX = width / 2 - dotsW / 2 + dotR;
+        for (let d = 0; d < catchTapRequired; d++) {
+            ctx.beginPath();
+            ctx.arc(dotsX + d * dotSpan, dotY, dotR, 0, Math.PI * 2);
+            ctx.fillStyle = d < catchTapCount ? '#FF8800' : 'rgba(255,255,255,0.25)';
+            ctx.fill();
+            ctx.strokeStyle = d < catchTapCount ? '#FFAA44' : 'rgba(255,255,255,0.4)';
+            ctx.lineWidth = 1.5; ctx.stroke();
+        }
+        ctx.restore();
     }
 
     if (btn) {
-        _spaceBtn = btn;
+        if (!_spaceBtn) _spaceBtn = btn; // WAITING+_canCatch 以外はここで設定
         ctx.save();
         const r = btn.large ? 20 : 14;
         // グロー
@@ -1083,7 +1120,7 @@ function drawRidingHUD() {
     ctx.fillStyle   = speedColor;
     ctx.shadowColor = speedColor; ctx.shadowBlur = 10;
     ctx.font        = 'bold 22px Courier New';
-    ctx.fillText(`初速 ${rideSpeed.toFixed(1)}  Wave Lv.${powerLevel}`, width / 2, by - 26);
+    ctx.fillText(`初速 ${Math.round(rideSpeed * 15)} km/h  Wave Lv.${powerLevel}`, width / 2, by - 26);
     ctx.shadowBlur  = 0;
 }
 
@@ -1152,9 +1189,10 @@ function drawScoreResult() {
     ctx.font         = `bold ${Math.min(20, width * 0.046)}px 'Courier New'`;
     ctx.fillText(`Wave Lv.${powerLevel}  ${stars}`, width / 2, infoY);
     ctx.shadowBlur   = 0;
+    const kmh = Math.round(lastRideSpeed * 15);
     ctx.fillStyle    = 'rgba(255,255,255,0.75)';
     ctx.font         = `${Math.min(16, width * 0.038)}px 'Courier New'`;
-    ctx.fillText(`初速 ${lastRideSpeed.toFixed(1)} px/f`, width / 2, infoY + Math.min(26, width * 0.058));
+    ctx.fillText(`初速 ${kmh} km/h`, width / 2, infoY + Math.min(26, width * 0.058));
 
     // ─ 褒めコメント ─
     const commentY = infoY + Math.min(26, width * 0.058) + Math.min(40, height * 0.06);
@@ -1260,7 +1298,7 @@ function drawPaddleBars() {
     ctx.fillStyle = 'rgba(255,255,255,0.75)';
     ctx.font      = '14px Courier New';
     ctx.textAlign = 'center';
-    ctx.fillText('◉ タップ or ← → でパドリング！', width / 2, judgmentY + JUDGMENT_HALF_Y + 30);
+    ctx.fillText('◉ 左右の丸をタップでパドリング！', width / 2, judgmentY + JUDGMENT_HALF_Y + 30);
 }
 
 // ─── 描画: テイクオフバー（中央縦流れ）──────────────────────
@@ -1316,7 +1354,7 @@ function drawTakeoffBar() {
     // 操作説明
     ctx.fillStyle = 'rgba(255,255,255,0.75)';
     ctx.font      = '14px Courier New';
-    ctx.fillText('◉ タップ or SPACE でテイクオフ！', width / 2, judgmentY + JUDGMENT_HALF_Y + 30);
+    ctx.fillText('◉ 中央の丸をタップでテイクオフ！', width / 2, judgmentY + JUDGMENT_HALF_Y + 30);
 }
 
 // ─── 描画: Catch the Wave フラッシュ ─────────────────────────

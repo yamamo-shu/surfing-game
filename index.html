@@ -296,7 +296,14 @@ function _onTouchStart(e) {
             continue;
         }
 
-        // その他の Space ボタン（SPOT_SELECT / BEACH / WAITING _canCatch）
+        // WAITING+_canCatch: 画面どこでもタップで連打カウント
+        if (gameState === STATES.WAITING && _canCatch) {
+            keysJustPressed.add('Space');
+            _touchMap.set(t.identifier, null);
+            continue;
+        }
+
+        // その他の Space ボタン（SPOT_SELECT / BEACH）
         if (_inRect(_spaceBtn, sx, sy)) {
             keysJustPressed.add('Space');
             _touchMap.set(t.identifier, null);
@@ -1020,7 +1027,7 @@ function drawTouchUI() {
             ctx.fillText('▲ swipe 前進', width / 2, height * 0.10);
             ctx.fillText('▼ swipe 後退', width / 2, height * 0.93);
         } else if (gameState === STATES.GET_OUT) {
-            ctx.fillText('double tap = ダックダイブ', width / 2, height * 0.10);
+            ctx.fillText('ダブルタップ = ダックダイブ', width / 2, height * 0.10);
             ctx.fillText('▼ swipe 後退', width / 2, height * 0.93);
         } else if (gameState === STATES.BEACH) {
             // ビーチでは上下ヒント不要
@@ -1336,7 +1343,7 @@ function drawTakeoffBar() {
     ctx.fillStyle = 'white';
     ctx.font      = `bold ${circFS}px Courier New`;
     ctx.textAlign = 'center';
-    ctx.fillText('TAP!', laneX, judgmentY + circFS * 0.4);
+    ctx.fillText('TakeOff!!', laneX, judgmentY + circFS * 0.4);
 
     // バー本体
     let barColor = '#FF8C00';
@@ -1349,7 +1356,7 @@ function drawTakeoffBar() {
     ctx.fillStyle = '#fff';
     ctx.font      = 'bold 17px Courier New';
     ctx.textAlign = 'center';
-    ctx.fillText('TAP!', laneX, bar.y + 7);
+    ctx.fillText('TakeOff!!', laneX, bar.y + 7);
 
     // 操作説明
     ctx.fillStyle = 'rgba(255,255,255,0.75)';

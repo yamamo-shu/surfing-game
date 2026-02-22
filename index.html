@@ -1,0 +1,1385 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Yamamossan Surfing</title>
+<style>
+    * { -webkit-tap-highlight-color: transparent; }
+    body { margin: 0; overflow: hidden; background-color: #000; display: flex; justify-content: center; align-items: center; height: 100vh; color: white; font-family: 'Courier New', monospace; touch-action: none; }
+    #game-container { position: relative; width: 100vw; height: 100vh; overflow: hidden; background-color: #00BFFF; touch-action: none; }
+    canvas { display: block; image-rendering: pixelated; touch-action: none; }
+    #ui { position: absolute; top: 10px; left: 10px; z-index: 10; text-shadow: 2px 2px 0 #000; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="game-container">
+    <canvas id="waveCanvas"></canvas>
+    <div id="ui">
+        <span id="distText" style="color:#00FF88; font-size:1.1em;"></span><br>
+        <span id="bestText" style="color:#F4D03F; font-size:1.4em; font-weight:bold; text-shadow:2px 2px 0 #000, 0 0 12px #F4D03F88;"></span>
+    </div>
+</div>
+
+<script src="images.js"></script>
+<script>
+// ─── 設定 ──────────────────────────────────────────────────
+const CHARACTER_SCALE   = 0.2;
+const SHOW_HALO         = true;
+const WAVE_SPEED        = 2.5;
+const PADDLE_BAR_SPEED  = 5;    // px/frame
+const TAKEOFF_BAR_SPEED = 4;
+const BAR_GAP           = 200;  // バー間距離(px)  ← speed×40frames で丁度次が来る
+const JUDGMENT_HALF_Y   = 38;   // 判定ゾーン上下幅
+const JUDGMENT_Y_RATIO  = 0.65; // 判定ラインY = height × this
+const LANE_OFFSET_RATIO = 0.18; // レーンX = width × (0.5 ± this)
+const PADDLE_BAR_W      = 82;
+const PADDLE_BAR_H      = 42;
+const TAKEOFF_BAR_W     = 96;
+const TAKEOFF_BAR_H     = 52;
+const WIPEOUT_PUSH_SPEED = 3.2; // スープ押し戻し速度 px/frame
+const WIPEOUT_FRAMES    = 150;  // ワイプアウト継続フレーム
+const TIME_FACTOR        = 60;   // rideEnergy = rideSpeed × TIME_FACTOR (フレーム数)
+const LATERAL_FACTOR     = 60;   // lateralBudget = rideSpeed × LATERAL_FACTOR (px)
+const RIDING_LATERAL_SPD = 3;    // 波乗り横移動速度 (px/frame)
+const GET_OUT_AUTO_SPD   = 0.67; // GettingOut 自動前進速度 (px/frame)
+const GET_OUT_SIDE_SPD   = 1.0;  // GettingOut 左右/後退速度 (px/frame)
+const WAITING_SPD        = 2.0;  // Waiting 4方向移動速度 (px/frame)
+const DUCK_DIVE_FRAMES   = 65;   // ダックダイブ持続フレーム (~1秒)
+const WAVE_SET_SPACING   = 350;  // セット内の波間隔 (フレーム)
+const WAVE_HEIGHT_BASE   = 40;   // 全レベル共通の最小波高 (px) at progress=0
+const WAVE_HEIGHT_MAX    = 380;  // Level10 の最大波高 (px) at progress=1
+
+// ─── Canvas/HTML セットアップ ───────────────────────────────
+const canvas   = document.getElementById('waveCanvas');
+const ctx      = canvas.getContext('2d');
+const distText = document.getElementById('distText');
+const bestText = document.getElementById('bestText');
+
+const gridSize = 16;
+let width, height;
+const loadedImgs = {};
+
+function makeTransparent(base64) {
+    return new Promise((resolve) => {
+        if (!base64 || base64.length < 50) { resolve(null); return; }
+        const img = new Image();
+        img.onload = () => {
+            const tmp = document.createElement('canvas');
+            tmp.width = img.width; tmp.height = img.height;
+            const tCtx = tmp.getContext('2d');
+            tCtx.drawImage(img, 0, 0);
+            const d = tCtx.getImageData(0, 0, img.width, img.height).data;
+            const id = tCtx.getImageData(0, 0, img.width, img.height);
+            for (let i = 0; i < id.data.length; i += 4) {
+                if (id.data[i] > 250 && id.data[i+1] > 250 && id.data[i+2] > 250) id.data[i+3] = 0;
+            }
+            tCtx.putImageData(id, 0, 0);
+            resolve(tmp);
+        };
+        img.onerror = () => resolve(null);
+        img.src = base64;
+    });
+}
+
+async function prepareAssets() {
+    if (typeof YAMAMOSSAN_ASSETS !== 'undefined') {
+        for (const key in YAMAMOSSAN_ASSETS) {
+            loadedImgs[key] = await makeTransparent(YAMAMOSSAN_ASSETS[key]);
+        }
+    }
+    startGame();
+}
+
+// ─── ステート定義 ────────────────────────────────────────────
+const STATES = {
+    SPOT_SELECT:    9,   // スポット選択画面
+    BEACH:          8,   // 岸でスタートポジション選択
+    GET_OUT:        0,   // 自動前進で沖へ向かう
+    WAITING:        1,
+    RIDING:         3,
+    WIPEOUT:        4,
+    CATCH_THE_WAVE: 5,
+    PADDLING_TRY:   6,
+    TAKEOFF_TRY:    7,
+    SCORE_DISPLAY:  10,  // ライド終了後スコア表示（キー待ち）
+};
+
+// ─── サーフスポット定義 ───────────────────────────────────────
+// sizeWeights: 10要素、index 0 = Level1 (tiny), index 9 = Level10 (huge)
+const SPOTS = [
+    {
+        name: 'Shonan', nameJP: '湘南',
+        desc: '小波中心。複数ピーク。台風時は特大スウェルも入る。',
+        peakCountRange: [2, 3],
+        terrainSpread:  60,
+        waveCountRange: [1, 2],
+        setIntervalRange: [250, 450],
+        sizeWeights: [0.3, 0.25, 0.2, 0.12, 0.07, 0.03, 0.01, 0.01, 0.005, 0.005],
+    },
+    {
+        name: 'Chiba-Kita', nameJP: '千葉北',
+        desc: 'ビーチブレイク。中程度の波が広範囲で横並びに発生しやすい。',
+        peakCountRange: [2, 3],  // ビーチは2〜3ピーク＝さらに横並び
+        terrainSpread:  330,     // 地形は広い範囲でバラける
+        waveCountRange: [1, 4],
+        setIntervalRange: [130, 250],
+        sizeWeights: [0.05, 0.1, 0.15, 0.2, 0.2, 0.15, 0.1, 0.04, 0.01, 0],
+    },
+    {
+        name: 'Bali',  nameJP: 'バリ島',
+        desc: 'リーフブレイク。大波が多く、2カ所のポイントで横並びに割れる。',
+        peakCountRange: [2, 2],  // リーフでも2ピーク＝横並び
+        terrainSpread:  80,      // 地形は固定気味（小ジャスター）
+        waveCountRange: [1, 2],  // 最大1バッチ×2ピーク=2本同時
+        setIntervalRange: [160, 300],
+        sizeWeights: [0, 0, 0, 0, 0, 0.03, 0.07, 0.15, 0.35, 0.40],
+    },
+];
+
+// ─── ゲーム変数 ──────────────────────────────────────────────
+let gameState        = STATES.SPOT_SELECT;
+let waveBottomY      = -1000;  // legacy: activeWave.bottomY から毎フレーム更新
+const beachHeight    = 120;
+let surferX = 0, surferY = 0;
+let currentWaveTopY  = -1000;
+let currentWaveBreakY = -1000;
+let currentWaveHeight = 60;   // グローバル公開（波の高さ px）
+let isFullyBroken    = false;
+const keys           = {};
+const keysJustPressed = new Set();
+
+// CTW: wave pauses when slowFactor=0
+let slowFactor       = 1.0;
+
+// 波乗りパラメータ
+let rideSpeed        = 2.0;   // 初速 (px/frame): 1.0〜4.0
+let rideEnergy       = 0;     // 残エネルギー (フレーム数、毎フレーム−1)
+let lateralBudget    = 0;     // 残横移動量 (px)
+let lateralBudgetMax = 0;     // 最大横移動量 (HUD用)
+
+// Catch the Wave 状態
+let ctwTimer           = 0;
+let ctwBars            = [];   // paddle bar objects
+let ctwBarIdx          = 0;    // 現在の判定対象バーインデックス
+let ctwTakeoffBar      = null;
+let ctwBasePaddleSpeed = PADDLE_BAR_SPEED;   // Waveパワーに応じたパドルバー基本速度
+let ctwTakeoffSpd      = TAKEOFF_BAR_SPEED;  // Waveパワーに応じたテイクオフバー速度
+let ctwSpeedVariation  = 0;                   // 高パワーほど各バーの速度がばらつく
+
+// スコア
+let ridingDistance    = 0;
+let lastScore         = 0;
+let bestScore         = 0;
+let scoreMessage      = '';
+let rideComment       = '';     // ライド終了時の褒めコメント
+let rideEndedOnBeach  = false;  // ビーチ到達でライド終了したか
+
+// ワイプアウト
+let wipeoutTimer     = 0;
+let wipeoutDX        = 0;
+
+// ダックダイブ
+let duckDiveTimer    = 0;   // >0 の間は潜水中（サーファー非表示、白波免疫）
+
+// 波形状（draw()で毎フレーム更新、update()の衝突判定で参照）
+let currentWidth      = 0;  // 波の現在の横幅 px (legacy: activeWave.width)
+let waveBreakProgress = 0;  // 崩れ進捗（0〜1）     (legacy: activeWave.breakProgress)
+
+// ─── マルチウェーブ システム ────────────────────────────────
+let waves            = [];    // 波オブジェクト配列
+let activeWave       = null;  // サーファーに最も近い波（毎フレーム更新）
+
+// 波スポーニング状態
+let waveSetRemaining = 0;    // 現セットで残り spawn 待ちの波数
+let waveSetTimer     = 0;    // 次の spawn までの残フレーム
+let waveSetCooldown  = 60;   // セット間の待機残フレーム（初期: 60f で即座に1セット目）
+
+// セッション固定パラメータ（initSession() で決定、ゲーム中は不変）
+let selectedSpot       = 0;        // 0=Bali, 1=Chiba-Kita, 2=Shonan
+let sessionPeakXs      = [];       // ピーク X 座標配列
+let sessionWaveCount   = 2;        // セットあたりの波数
+let sessionSetInterval = 300;      // セット間隔 (フレーム)
+
+// ─── 初期化 ─────────────────────────────────────────────────
+function init() {
+    width  = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width  = width;
+    canvas.height = height;
+    surferX = width / 2;
+    surferY = height - beachHeight - 50;
+}
+
+window.addEventListener('keydown', (e) => {
+    if (!keys[e.code]) keysJustPressed.add(e.code);
+    keys[e.code] = true;
+});
+window.addEventListener('keyup',   (e) => { keys[e.code] = false; });
+
+// ─── スマホ タッチ サポート ──────────────────────────────────
+let _canCatch  = false;   // WAITINGでのテイクオフ可能フラグ（タッチUI用）
+let _spaceBtn  = null;    // 現フレームのSpaceボタン領域 {x,y,w,h,label,color}
+const _touchMap = new Map(); // touchId → key
+
+function _touchZoneKey(tx, ty) {
+    // 画面を対角線で4分割: |dy|>|dx| なら上/下、そうでなければ左/右
+    const dx = tx - width / 2, dy = ty - height / 2;
+    if (Math.abs(dy) > Math.abs(dx)) return dy < 0 ? 'ArrowUp' : 'ArrowDown';
+    return dx < 0 ? 'ArrowLeft' : 'ArrowRight';
+}
+
+function _inRect(r, tx, ty) {
+    return r && tx >= r.x && tx <= r.x + r.w && ty >= r.y && ty <= r.y + r.h;
+}
+
+function _onTouchStart(e) {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+        const tx = t.clientX, ty = t.clientY;
+
+        // SCORE_DISPLAY はどこでもタップで続行
+        if (gameState === STATES.SCORE_DISPLAY) {
+            keysJustPressed.add('Space');
+            _touchMap.set(t.identifier, null);
+            continue;
+        }
+
+        // Spaceボタン領域を優先判定
+        const key = _inRect(_spaceBtn, tx, ty) ? 'Space' : _touchZoneKey(tx, ty);
+        if (key && !keys[key]) keysJustPressed.add(key);
+        if (key) keys[key] = true;
+        _touchMap.set(t.identifier, key);
+    }
+}
+
+function _onTouchEnd(e) {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+        const key = _touchMap.get(t.identifier);
+        if (key) keys[key] = false;
+        _touchMap.delete(t.identifier);
+    }
+}
+
+// canvasにタッチイベント登録（startGame後に追加するため window 経由でも可）
+window.addEventListener('touchstart',  _onTouchStart, { passive: false });
+window.addEventListener('touchend',    _onTouchEnd,   { passive: false });
+window.addEventListener('touchcancel', _onTouchEnd,   { passive: false });
+
+// ─── CTW ヘルパー ────────────────────────────────────────────
+function startCatchTheWave() {
+    // ─ 初速計算: 波サイズ × Yライン × Xセンター距離 ─
+    // waveSizeFactor: 0(Level1) 〜 1.0(Level10)
+    const waveSizeFactor = activeWave ? (activeWave.sizeLevel - 1) / 9 : 0;
+    // positionFactor: 0(ボトム) 〜 1(トップライン)  Y軸
+    const refBreakY      = activeWave ? activeWave.breakY  : currentWaveBreakY;
+    const refBottomY     = activeWave ? activeWave.bottomY : waveBottomY;
+    const waveRange      = refBottomY - refBreakY;
+    const positionFactor = waveRange > 5
+        ? 1 - Math.max(0, Math.min(1, (surferY - refBreakY) / waveRange))
+        : 0.5;
+    // xFactor: 0(エッジ) 〜 1.0(センター)  X軸
+    const xFactor = activeWave && activeWave.width > 0
+        ? 1 - Math.min(1, Math.abs(surferX - activeWave.centerX) / (activeWave.width / 2))
+        : 0.5;
+    // positionBonus: Y・X 位置の合成 0〜1.0
+    const positionBonus = (positionFactor + xFactor) / 2;
+    // rideSpeed: サイズ主因子 + 位置で上乗せ
+    //   Level1  最高: 1.0 + 0   + 0.5 = 1.5 → Lv.3
+    //   Level10 最低: 1.0 + 2.0 + 0.0 = 3.0 → Lv.7
+    //   Level10 最高: 1.0 + 2.0 + 1.0 = 4.0 → Lv.10
+    rideSpeed = 1.0 + waveSizeFactor * 2.0 + positionBonus * (0.5 + waveSizeFactor * 0.5);
+    rideEnergy       = Math.round(rideSpeed * TIME_FACTOR); // 総フレーム数
+    lateralBudget    = rideSpeed * LATERAL_FACTOR;          // 横移動可能px
+    lateralBudgetMax = lateralBudget;
+
+    // Waveパワーに応じた CTW バースピード計算
+    // powerFrac: 0(Lv.1) 〜 1.0(Lv.10)
+    const powerFrac       = Math.min(1, (rideSpeed - 1.0) / 3.0);
+    ctwBasePaddleSpeed    = 3 + powerFrac * 5;     // Lv.1≈3 px/f, Lv.10≈8 px/f
+    ctwTakeoffSpd         = 2 + powerFrac * 5;     // Lv.1≈2 px/f, Lv.10≈7 px/f
+    ctwSpeedVariation     = 0.3 + powerFrac * 2.2; // Lv.1≈±0.3, Lv.10≈±2.5
+
+    slowFactor    = 0;
+    gameState     = STATES.CATCH_THE_WAVE;
+    ctwTimer      = 90;
+    ctwBarIdx     = 0;
+    ctwBars       = [];
+    ctwTakeoffBar = null;
+}
+
+function initPaddleBars() {
+    const powerFrac = Math.min(1, Math.max(0, (rideSpeed - 1.0) / 3.0));
+    // バー数: Lv.1=2, Lv.10=5。高パワーほど ±1 のランダム変動あり
+    let barCount = 2 + Math.floor(powerFrac * 3.0);
+    if (Math.random() < powerFrac * 0.6) barCount += (Math.random() < 0.55 ? 1 : -1);
+    barCount = Math.max(2, Math.min(5, barCount));
+
+    const first = Math.random() < 0.5 ? -1 : 1; // -1=左, 1=右
+    ctwBars = [];
+    for (let i = 0; i < barCount; i++) {
+        const lane = (i % 2 === 0) ? first : -first;
+        // 各バーの速度: 基本速度 ± ランダム変動（高パワーほど大きくばらつく）
+        const spd = Math.max(1.5, ctwBasePaddleSpeed + (Math.random() * 2 - 1) * ctwSpeedVariation);
+        ctwBars.push({
+            y:           -PADDLE_BAR_H / 2 - i * BAR_GAP,
+            lane:        lane,
+            requiredKey: lane === -1 ? 'ArrowLeft' : 'ArrowRight',
+            speed:       spd,
+            resolved:    false,
+            success:     false,
+            padFlash:    0,
+            padSuccess:  false
+        });
+    }
+    ctwBarIdx = 0;
+}
+
+function startTakeoffTry() {
+    gameState = STATES.TAKEOFF_TRY;
+    ctwTakeoffBar = {
+        y:           -TAKEOFF_BAR_H / 2,
+        flashTimer:  0,
+        flashSuccess: false
+    };
+}
+
+function triggerWipeout() {
+    gameState     = STATES.WIPEOUT;
+    slowFactor    = 1.0;
+    wipeoutTimer  = WIPEOUT_FRAMES;
+    wipeoutDX     = (Math.random() < 0.5 ? 1 : -1) * 1.8;
+    distText.innerText = '';
+}
+
+function endRiding() {
+    lastScore = Math.round(ridingDistance / 10);
+    if (lastScore > bestScore) bestScore = lastScore;
+    scoreMessage = lastScore >= 300 ? 'LEGENDARY RIDE!!!'
+                 : lastScore >= 200 ? 'GREAT RIDE!!'
+                 : lastScore >= 100 ? 'NICE RIDE!'
+                 : lastScore >= 50  ? 'DECENT RIDE!'
+                 :                    'SHORT RIDE';
+    rideComment  = lastScore >= 300 ? '伝説のライドだ！海が君を選んだ！'
+                 : lastScore >= 200 ? '最高のライド！波と完全に一体になった！'
+                 : lastScore >= 100 ? 'いいライドだ！その調子で波を乗りこなせ！'
+                 : lastScore >= 50  ? '悪くない！次は波のパワーをもっと活かせ！'
+                 :                    'もう少し！波のピークに近づいてパドルしよう！';
+    // ビーチ到達か否かを記憶（SCORE_DISPLAY 後の遷移先判断用）
+    rideEndedOnBeach = surferY > height - beachHeight;
+    if (rideEndedOnBeach) surferY = height - beachHeight - 40;
+    gameState  = STATES.SCORE_DISPLAY;
+    slowFactor = 1.0;
+    distText.innerText = '';
+    bestText.innerText = bestScore > 0 ? `BEST: ${bestScore} m` : '';
+}
+
+// ─── パドリングトライ更新 ─────────────────────────────────────
+function updatePaddlingTry() {
+    const judgmentY = height * JUDGMENT_Y_RATIO;
+
+    // 全バーを下に移動（各バー固有の速度を使用）
+    for (const bar of ctwBars) {
+        bar.y += bar.speed;
+        if (bar.padFlash > 0) bar.padFlash--;
+    }
+
+    if (ctwBarIdx >= ctwBars.length) return;
+    const bar = ctwBars[ctwBarIdx];
+
+    // フラッシュ終了 → 判定して次へ
+    if (bar.resolved && bar.padFlash === 0) {
+        if (!bar.success) { triggerWipeout(); return; }
+        ctwBarIdx++;
+        if (ctwBarIdx >= ctwBars.length) startTakeoffTry();
+        return;
+    }
+    if (bar.resolved) return; // まだフラッシュ中
+
+    const inJudgment = Math.abs(bar.y - judgmentY) <= JUDGMENT_HALF_Y;
+    const passed     = bar.y > judgmentY + JUDGMENT_HALF_Y + PADDLE_BAR_H / 2;
+
+    if (passed) {
+        // 見逃し失敗
+        bar.resolved = true; bar.success = false;
+        bar.padFlash = 25;   bar.padSuccess = false;
+        return;
+    }
+
+    if (inJudgment) {
+        if (keysJustPressed.has(bar.requiredKey)) {
+            // 正解
+            bar.resolved = true; bar.success = true;
+            bar.padFlash = 20;   bar.padSuccess = true;
+        } else {
+            // 誤キー
+            const wrong = bar.requiredKey === 'ArrowRight' ? 'ArrowLeft' : 'ArrowRight';
+            if (keysJustPressed.has(wrong)) {
+                bar.resolved = true; bar.success = false;
+                bar.padFlash = 25;   bar.padSuccess = false;
+            }
+        }
+    }
+}
+
+// ─── テイクオフトライ更新 ─────────────────────────────────────
+function updateTakeoffTry() {
+    const bar = ctwTakeoffBar;
+    if (!bar) return;
+
+    if (bar.flashTimer > 0) {
+        bar.flashTimer--;
+        if (bar.flashTimer === 0) {
+            if (bar.flashSuccess) {
+                slowFactor     = 1.0;
+                ridingDistance = 0;
+                gameState      = STATES.RIDING;
+            } else {
+                triggerWipeout();
+            }
+        }
+        return;
+    }
+
+    bar.y += ctwTakeoffSpd;
+    const judgmentY  = height * JUDGMENT_Y_RATIO;
+    const inJudgment = Math.abs(bar.y - judgmentY) <= JUDGMENT_HALF_Y;
+    const passed     = bar.y > judgmentY + JUDGMENT_HALF_Y + TAKEOFF_BAR_H / 2;
+
+    if (passed) {
+        bar.flashSuccess = false; bar.flashTimer = 25;
+        return;
+    }
+    if (inJudgment && keysJustPressed.has('Space')) {
+        bar.flashSuccess = true; bar.flashTimer = 20;
+    }
+}
+
+// ─── セッション初期化 ─────────────────────────────────────────
+function initSession() {
+    const spot = SPOTS[selectedSpot];
+    // ピーク X 座標を生成（セッション固定）
+    const numPeaks = spot.peakCountRange[0]
+                   + Math.floor(Math.random() * (spot.peakCountRange[1] - spot.peakCountRange[0] + 1));
+    sessionPeakXs = [];
+    for (let i = 0; i < numPeaks; i++) {
+        const baseX  = width * 0.2 + width * 0.6 * (i + 0.5) / numPeaks;
+        const jitter = (Math.random() - 0.5) * spot.terrainSpread;
+        sessionPeakXs.push(Math.max(width * 0.15, Math.min(width * 0.85, baseX + jitter)));
+    }
+    // セットあたり波数（セッション固定）
+    const [wMin, wMax] = spot.waveCountRange;
+    sessionWaveCount = wMin + Math.floor(Math.random() * (wMax - wMin + 1));
+    // セット間隔（セッション固定）
+    const [sMin, sMax] = spot.setIntervalRange;
+    sessionSetInterval = sMin + Math.floor(Math.random() * (sMax - sMin + 1));
+    // 波システムリセット
+    waves = []; activeWave = null;
+    waveSetRemaining = 0; waveSetTimer = 0; waveSetCooldown = 60;
+    // プレイヤーとスコアをリセット
+    surferX = width / 2;
+    surferY = height - beachHeight - 50;
+    bestScore = 0;
+    gameState = STATES.BEACH;
+}
+
+// ─── 波サイズ抽選 ─────────────────────────────────────────────
+function pickSizeLevel() {
+    const w = SPOTS[selectedSpot].sizeWeights;
+    let r = Math.random() * w.reduce((a, b) => a + b, 0);
+    for (let i = 0; i < w.length; i++) { r -= w[i]; if (r <= 0) return i + 1; }
+    return w.length;
+}
+
+// ─── 波スポーン ───────────────────────────────────────────────
+// peakIdx: 指定ピークを使用（-1 または省略でランダム）
+function spawnWave(peakIdx = -1) {
+    const sizeLevel = pickSizeLevel();
+    const peak      = (peakIdx >= 0 && peakIdx < sessionPeakXs.length)
+                    ? sessionPeakXs[peakIdx]
+                    : sessionPeakXs[Math.floor(Math.random() * sessionPeakXs.length)];
+    const spread    = SPOTS[selectedSpot].terrainSpread;
+    const centerX   = Math.max(width * 0.15, Math.min(width * 0.85,
+                          peak + (Math.random() - 0.5) * spread * 0.5));
+    // 大きい波ほど速い: Level1=×0.3(0.75px/f), Level10=×1.0(2.5px/f)
+    const sizeFrac = (sizeLevel - 1) / 9;
+    const speed    = WAVE_SPEED * (0.3 + 0.7 * sizeFrac);
+    waves.push({ bottomY: -200, sizeLevel, centerX, speed,
+                 progress: 0, height: WAVE_HEIGHT_BASE, width: 0,
+                 topY: -250, breakProgress: 0, breakY: -300, isFullyBroken: false });
+}
+
+// ─── 波スポーニング管理 ───────────────────────────────────────
+function maybeSpawnWave() {
+    if (slowFactor === 0) return;          // CTW 中は停止
+    if (waveSetTimer > 0) { waveSetTimer--; return; }
+    if (waveSetRemaining > 0) {
+        // X方向に並列: sessionPeakXs のピーク数分を同時スポーン
+        const batchSize = Math.min(waveSetRemaining, sessionPeakXs.length);
+        for (let i = 0; i < batchSize; i++) spawnWave(i);
+        waveSetRemaining -= batchSize;
+        if (waveSetRemaining > 0) waveSetTimer = WAVE_SET_SPACING;
+    } else if (waveSetCooldown > 0) {
+        waveSetCooldown--;
+    } else {
+        waveSetRemaining = sessionWaveCount;
+        waveSetCooldown  = sessionSetInterval;
+    }
+}
+
+// ─── 波プロパティ更新（毎フレーム） ──────────────────────────
+function updateWaveProps(wave) {
+    const p = Math.min(Math.max((wave.bottomY + 200) / (height + 150), 0), 1.1);
+    wave.progress      = p;
+    wave.isFullyBroken = p > 0.9;
+    wave.height        = WAVE_HEIGHT_BASE
+                       + (wave.sizeLevel - 1) / 9 * (WAVE_HEIGHT_MAX - WAVE_HEIGHT_BASE) * p;
+    // 横幅: 大きい波ほど広く（Level1=25%、Level10=95%）、進行とともに拡大
+    const sizeFrac = (wave.sizeLevel - 1) / 9;
+    wave.width         = width * (0.25 + 0.70 * sizeFrac) * (0.35 + 0.65 * p);
+    wave.topY          = wave.bottomY - wave.height;
+    const bp           = p > 0.3 ? (p - 0.3) / 0.65 : 0;
+    wave.breakProgress = bp;
+    wave.breakY        = wave.topY + wave.height * bp;
+}
+
+// ─── activeWave 決定 ──────────────────────────────────────────
+function findActiveWave() {
+    let best = null, bestDist = Infinity;
+    // X 範囲内の波を優先
+    for (const wave of waves) {
+        const dx = Math.abs(surferX - wave.centerX);
+        if (wave.width > 0 && dx < wave.width / 2) {
+            const dy = Math.abs(surferY - (wave.topY + wave.height * 0.5));
+            if (dy < bestDist) { bestDist = dy; best = wave; }
+        }
+    }
+    // フォールバック: 全波で最近傍
+    if (!best) {
+        for (const wave of waves) {
+            const dy = Math.abs(surferY - (wave.topY + wave.height * 0.5));
+            if (dy < bestDist) { bestDist = dy; best = wave; }
+        }
+    }
+    return best;
+}
+
+// ─── 全波のワイプアウト判定 ───────────────────────────────────
+function checkWipeoutAll() {
+    for (const wave of waves) {
+        const dist = Math.abs(surferX - wave.centerX);
+        if (wave.width <= 0 || dist >= wave.width / 2) continue;
+        const arc     = Math.pow(dist / (wave.width / 2), 2) * wave.height;
+        const topYatX = wave.topY + arc;
+        if (surferY <= topYatX || surferY >= wave.bottomY) continue;
+        const colFrac = (wave.bottomY > topYatX)
+            ? (surferY - topYatX) / (wave.bottomY - topYatX) : 0;
+        if (colFrac < wave.breakProgress || wave.isFullyBroken) { triggerWipeout(); return; }
+    }
+}
+
+// ─── 波の描画 ─────────────────────────────────────────────────
+function drawWave(wave) {
+    const halfW = wave.width / 2;
+    for (let x = 0; x < width; x += gridSize) {
+        const dist = Math.abs(x - wave.centerX);
+        if (dist >= halfW) continue;
+        const arc  = Math.pow(dist / halfW, 2) * wave.height;
+        const topY = wave.topY + arc;
+        for (let y = topY; y < wave.bottomY; y += gridSize) {
+            if (y >= height - beachHeight + gridSize) continue;
+            const colFrac = (wave.bottomY > topY) ? (y - topY) / (wave.bottomY - topY) : 0;
+            const color   = colFrac < wave.breakProgress || wave.isFullyBroken ? '#FFFFFF' : '#0066FF';
+            ctx.fillStyle = '#003366'; ctx.fillRect(x, Math.floor(y), gridSize, gridSize);
+            ctx.fillStyle = color;     ctx.fillRect(x + 1, Math.floor(y) + 1, gridSize - 2, gridSize - 2);
+        }
+    }
+}
+
+// ─── スポット選択画面の描画 ───────────────────────────────────
+function drawSpotSelect() {
+    // 背景グラデーション
+    const grad = ctx.createLinearGradient(0, 0, 0, height);
+    grad.addColorStop(0, '#000D2A'); grad.addColorStop(1, '#002060');
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, width, height);
+    ctx.fillStyle = '#F4D03F'; ctx.fillRect(0, height - beachHeight, width, beachHeight);
+
+    // タイトル
+    ctx.textAlign = 'center';
+    ctx.font = "bold italic 52px 'Courier New'";
+    ctx.shadowColor = '#44AAFF'; ctx.shadowBlur = 24;
+    ctx.fillStyle = '#44AAFF';
+    ctx.fillText('Yamamossan Surfing', width / 2, height * 0.14);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.font = "18px 'Courier New'";
+    ctx.fillText('〜 Select Surf Spot 〜', width / 2, height * 0.14 + 50);
+
+    // スポットタブ
+    const tabW = 180, tabH = 50, tabY = height * 0.33, tabGap = 28;
+    const totalW = SPOTS.length * tabW + (SPOTS.length - 1) * tabGap;
+    const tabStartX = width / 2 - totalW / 2;
+    for (let i = 0; i < SPOTS.length; i++) {
+        const tx  = tabStartX + i * (tabW + tabGap);
+        const sel = i === selectedSpot;
+        ctx.fillStyle = sel ? '#44AAFF' : 'rgba(255,255,255,0.12)';
+        ctx.beginPath(); ctx.roundRect(tx, tabY, tabW, tabH, 8); ctx.fill();
+        if (sel) { ctx.strokeStyle = '#88CCFF'; ctx.lineWidth = 2; ctx.stroke(); }
+        ctx.fillStyle = sel ? '#001133' : 'rgba(255,255,255,0.75)';
+        ctx.font = sel ? "bold 17px 'Courier New'" : "15px 'Courier New'";
+        ctx.fillText(SPOTS[i].nameJP, tx + tabW / 2, tabY + 32);
+    }
+
+    // 詳細パネル
+    const spot = SPOTS[selectedSpot];
+    const detY = height * 0.33 + tabH + 20;
+    ctx.fillStyle = 'rgba(0,10,50,0.75)';
+    ctx.beginPath(); ctx.roundRect(width / 2 - 310, detY, 620, 220, 14); ctx.fill();
+    ctx.strokeStyle = 'rgba(68,170,255,0.3)'; ctx.lineWidth = 1; ctx.stroke();
+
+    ctx.fillStyle = '#F4D03F';
+    ctx.font = "bold 22px 'Courier New'"; ctx.textAlign = 'center';
+    ctx.fillText(spot.nameJP, width / 2, detY + 36);
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.font = "13px 'Courier New'";
+    ctx.fillText(spot.desc, width / 2, detY + 62);
+
+    // パラメータバー（3本）
+    const avgSz  = spot.sizeWeights.reduce((s, w, i) => s + w * (i + 1), 0) / 10;
+    const terr   = 1 - Math.min(1, spot.terrainSpread / 200);
+    const avgCnt = (spot.waveCountRange[0] + spot.waveCountRange[1]) / 2;
+    const avgInt = (spot.setIntervalRange[0] + spot.setIntervalRange[1]) / 2;
+    const freq   = Math.min(1, avgCnt / 4 * (300 / avgInt));
+    const bars   = [
+        { label: '波サイズ',   val: avgSz,  color: '#44AAFF' },
+        { label: '地形の定点性', val: terr,  color: '#00FF88' },
+        { label: '波の頻度',   val: freq,  color: '#F4D03F' },
+    ];
+    for (let i = 0; i < bars.length; i++) {
+        const by = detY + 88 + i * 38;
+        ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.font = "12px 'Courier New'";
+        ctx.textAlign = 'right';
+        ctx.fillText(bars[i].label, width / 2 - 100, by + 12);
+        const bx = width / 2 - 88, bw = 200;
+        ctx.fillStyle = 'rgba(255,255,255,0.15)'; ctx.fillRect(bx, by, bw, 16);
+        ctx.fillStyle = bars[i].color;             ctx.fillRect(bx, by, bw * bars[i].val, 16);
+        ctx.strokeStyle = 'rgba(255,255,255,0.2)'; ctx.lineWidth = 1;
+        ctx.strokeRect(bx, by, bw, 16);
+        ctx.textAlign = 'left';
+        ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.font = "11px 'Courier New'";
+        ctx.fillText(`${Math.round(bars[i].val * 100)}%`, bx + bw + 6, by + 12);
+    }
+
+    // 点滅する操作説明
+    const alpha = 0.5 + 0.5 * Math.sin(Date.now() / 500);
+    ctx.fillStyle = `rgba(255,255,255,${alpha.toFixed(2)})`;
+    ctx.font = "15px 'Courier New'"; ctx.textAlign = 'center';
+    ctx.fillText('← → でスポット変更', width / 2, height - beachHeight - 45);
+
+    // タッチUI（スタートボタン）
+    drawTouchUI();
+}
+
+// ─── メイン更新 ──────────────────────────────────────────────
+function update() {
+    // ワイプアウト: スープに押し戻される
+    if (gameState === STATES.WIPEOUT) {
+        wipeoutTimer--;
+        surferY += WIPEOUT_PUSH_SPEED;
+        surferX += wipeoutDX * Math.sin(wipeoutTimer * 0.35);
+        surferX  = Math.max(20, Math.min(width - 20, surferX));
+        if (wipeoutTimer <= 0 || surferY >= height - beachHeight - 5) {
+            gameState     = STATES.BEACH;
+            surferY       = height - beachHeight - 40;
+            duckDiveTimer = 0;
+        }
+        keysJustPressed.clear();
+        return;
+    }
+
+    const isCTW = gameState === STATES.PADDLING_TRY
+               || gameState === STATES.TAKEOFF_TRY
+               || gameState === STATES.CATCH_THE_WAVE;
+
+    // ─── BEACH: 左右でポジション決め、SPACE でスタート ─────────
+    if (gameState === STATES.BEACH) {
+        surferY = height - beachHeight - 40; // 岸に固定
+        if (keys['ArrowLeft'])  surferX -= 4;
+        if (keys['ArrowRight']) surferX += 4;
+        if (keysJustPressed.has('Space')) {
+            gameState     = STATES.GET_OUT;
+            duckDiveTimer = 0;
+        }
+        surferX = Math.max(20, Math.min(width - 20, surferX));
+        keysJustPressed.clear();
+        return;
+    }
+
+    // ─── GET_OUT: 自動前進 + 左右後退 + ダックダイブ ────────────
+    if (gameState === STATES.GET_OUT) {
+        surferY -= GET_OUT_AUTO_SPD;                      // 自動で沖へ
+        if (keys['ArrowLeft'])  surferX -= GET_OUT_SIDE_SPD;
+        if (keys['ArrowRight']) surferX += GET_OUT_SIDE_SPD;
+        if (keys['ArrowDown'])  surferY += GET_OUT_SIDE_SPD; // 後退OK
+
+        // ダックダイブ
+        if (duckDiveTimer > 0) {
+            duckDiveTimer--;
+        } else if (keysJustPressed.has('ArrowUp')) {
+            duckDiveTimer = DUCK_DIVE_FRAMES;
+        }
+
+        surferX = Math.max(20, Math.min(width - 20, surferX));
+        surferY = Math.max(20, Math.min(height - 10, surferY));
+
+        if (surferY < height * 0.3) { duckDiveTimer = 0; gameState = STATES.WAITING; }
+
+        // 白波判定（ダックダイブ中は免疫）、全波チェック
+        if (duckDiveTimer === 0) checkWipeoutAll();
+        keysJustPressed.clear();
+        return;
+    }
+
+    // ─── WAITING: 通常4方向移動 ─────────────────────────────────
+    if (gameState === STATES.WAITING) {
+        if (keys['ArrowLeft'])  surferX -= WAITING_SPD;
+        if (keys['ArrowRight']) surferX += WAITING_SPD;
+        if (keys['ArrowUp'])    surferY -= WAITING_SPD;
+        if (keys['ArrowDown'])  surferY += WAITING_SPD;
+    }
+
+    if (gameState === STATES.WAITING) {
+        let canCatch = false;
+        if (activeWave && !activeWave.isFullyBroken) {
+            const _dx = Math.abs(surferX - activeWave.centerX);
+            canCatch = _dx < activeWave.width / 2
+                    && surferY >= activeWave.breakY
+                    && surferY <  activeWave.bottomY;
+        }
+        _canCatch = canCatch; // スマホUIへ公開
+        if (keysJustPressed.has('Space') && canCatch) startCatchTheWave();
+
+    } else if (gameState === STATES.CATCH_THE_WAVE) {
+        _canCatch = false;
+        ctwTimer--;
+        if (ctwTimer <= 0) { gameState = STATES.PADDLING_TRY; initPaddleBars(); }
+
+    } else if (gameState === STATES.PADDLING_TRY) {
+        updatePaddlingTry();
+
+    } else if (gameState === STATES.TAKEOFF_TRY) {
+        updateTakeoffTry();
+
+    } else if (gameState === STATES.RIDING) {
+        // 縦: 波に押されて岸へ（操作不可）
+        surferY        += rideSpeed;
+        ridingDistance += rideSpeed;
+        rideEnergy--;
+
+        // 横: 左右キーでバジェット消費 + X軸移動距離も加算
+        if (lateralBudget > 0) {
+            if (keys['ArrowLeft']) {
+                surferX        -= RIDING_LATERAL_SPD;
+                lateralBudget   = Math.max(0, lateralBudget - RIDING_LATERAL_SPD);
+                ridingDistance += RIDING_LATERAL_SPD;
+            }
+            if (keys['ArrowRight']) {
+                surferX        += RIDING_LATERAL_SPD;
+                lateralBudget   = Math.max(0, lateralBudget - RIDING_LATERAL_SPD);
+                ridingDistance += RIDING_LATERAL_SPD;
+            }
+        }
+
+        // 岸到達 or エネルギー切れ → ライド終了（距離表示はキャンバスで行う）
+        if (surferY > height - beachHeight || rideEnergy <= 0) endRiding();
+
+    } else if (gameState === STATES.SCORE_DISPLAY) {
+        // 任意キーで GettingOut へ復帰
+        if (keysJustPressed.size > 0) {
+            gameState = rideEndedOnBeach ? STATES.BEACH : STATES.GET_OUT;
+        }
+    }
+
+    surferX = Math.max(20, Math.min(width - 20, surferX));
+    surferY = Math.max(20, Math.min(height - 10, surferY));
+
+    // 白波の衝突判定（WAITING のみ、全波チェック）
+    if (gameState === STATES.WAITING) checkWipeoutAll();
+
+    keysJustPressed.clear();
+}
+
+// ─── 描画: ステートラベル ────────────────────────────────────
+function drawStateLabel() {
+    if (gameState === STATES.CATCH_THE_WAVE) return; // 別関数で描画
+    if (gameState === STATES.SCORE_DISPLAY)  return; // drawScoreResult() が担当
+    const t = Date.now();
+
+    let label = '', color = 'white', size = 40, y = 65;
+
+    switch (gameState) {
+        case STATES.BEACH:
+            label = 'On the Beach'; color = '#F4D03F'; size = 32; break;
+        case STATES.GET_OUT:
+            label = 'Getting Out'; color = '#87CEEB'; size = 36; break;
+        case STATES.WAITING:
+            label = 'Waiting...';  color = '#B0E0FF'; size = 34; break;
+        case STATES.PADDLING_TRY:
+            label = 'Catch the Wave'; color = '#44AAFF'; size = 30; break;
+        case STATES.TAKEOFF_TRY:
+            label = 'Take Off!'; color = '#FF8C00'; size = 46; y = 70; break;
+        case STATES.RIDING:
+            const pulse = 1 + 0.09 * Math.sin(t / 180);
+            label = 'Stoke!'; color = '#F4D03F';
+            size  = Math.round(52 * pulse); y = height * 0.15; break;
+        case STATES.WIPEOUT:
+            const shake = Math.sin(t / 60) * 4;
+            label = 'Wipe Out!'; color = '#FF4444'; size = 46;
+            ctx.save();
+            ctx.translate(shake, 0);
+            break;
+    }
+
+    if (!label) return;
+
+    ctx.textAlign   = 'center';
+    ctx.font        = `bold italic ${size}px 'Courier New'`;
+    ctx.shadowColor = '#000'; ctx.shadowBlur = 12;
+    ctx.lineWidth   = 5;
+    ctx.strokeStyle = 'rgba(0,0,0,0.65)';
+    ctx.strokeText(label, width / 2, y);
+    ctx.fillStyle   = color;
+    ctx.fillText(label, width / 2, y);
+    ctx.shadowBlur  = 0;
+
+    if (gameState === STATES.WIPEOUT) ctx.restore();
+}
+
+// ─── 描画: タッチUI（スマホ対応）────────────────────────────
+// ・対角線4分割ゾーンのヒント
+// ・ステートに応じた Space ボタン（TAKEOFF_TRY は大型 TAKE OFF ボタン）
+function drawTouchUI() {
+    _spaceBtn = null; // 毎フレームリセット
+
+    // ── 対角線ゾーンヒント（方向入力が有効なステートのみ）──
+    const showZones = gameState === STATES.GET_OUT
+                   || gameState === STATES.WAITING
+                   || gameState === STATES.RIDING
+                   || gameState === STATES.BEACH
+                   || gameState === STATES.PADDLING_TRY;
+    if (showZones) {
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([8, 10]);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);       ctx.lineTo(width, height);
+        ctx.moveTo(width, 0);   ctx.lineTo(0, height);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // 4隅の方向ラベル
+        const pad = 18, fs = 13;
+        ctx.font = `${fs}px Courier New`;
+        ctx.fillStyle = 'rgba(255,255,255,0.18)';
+        ctx.textAlign = 'center';
+        ctx.fillText('▲', width / 2, pad + fs);
+        ctx.fillText('▼', width / 2, height - pad);
+        ctx.textAlign = 'left';
+        ctx.fillText('◀', pad, height / 2);
+        ctx.textAlign = 'right';
+        ctx.fillText('▶', width - pad, height / 2);
+        ctx.restore();
+    }
+
+    // ── コンテキスト別 Space ボタン ──
+    const bw = Math.min(230, width * 0.55);
+    const bh = 62;
+    const bx = width / 2 - bw / 2;
+    let btn = null;
+
+    if (gameState === STATES.SPOT_SELECT) {
+        btn = { x: bx, y: height - beachHeight - 100, w: bw, h: bh,
+                label: 'SPACE / タップ でスタート', color: '#22AA55' };
+    } else if (gameState === STATES.BEACH) {
+        btn = { x: bx, y: height - beachHeight - 100, w: bw, h: bh,
+                label: 'パドルアウト！', color: '#2288CC' };
+    } else if (gameState === STATES.WAITING && _canCatch) {
+        btn = { x: bx, y: height * 0.70, w: bw, h: bh,
+                label: '乗る！  CATCH!', color: '#FF8800' };
+    } else if (gameState === STATES.TAKEOFF_TRY) {
+        // テイクオフは大型の専用ボタン
+        const tbw = Math.min(300, width * 0.68);
+        const tbh = 86;
+        btn = { x: width / 2 - tbw / 2, y: height * 0.80, w: tbw, h: tbh,
+                label: 'TAKE OFF !', color: '#FF4400', large: true };
+    }
+
+    if (btn) {
+        _spaceBtn = btn;
+        ctx.save();
+        const r = btn.large ? 20 : 14;
+        // グロー
+        ctx.shadowColor = btn.color; ctx.shadowBlur = btn.large ? 28 : 16;
+        ctx.fillStyle   = btn.color + 'CC';
+        ctx.beginPath(); ctx.roundRect(btn.x, btn.y, btn.w, btn.h, r); ctx.fill();
+        ctx.shadowBlur  = 0;
+        // 枠線
+        ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = btn.large ? 2.5 : 1.5;
+        ctx.stroke();
+        // ラベル
+        const fs2 = btn.large ? Math.min(28, btn.h * 0.36) : Math.min(18, btn.h * 0.32);
+        ctx.font      = `bold ${fs2}px 'Courier New'`;
+        ctx.fillStyle = 'white';
+        ctx.textAlign = 'center';
+        ctx.shadowColor = 'rgba(0,0,0,0.8)'; ctx.shadowBlur = 8;
+        ctx.fillText(btn.label, btn.x + btn.w / 2, btn.y + btn.h * 0.62);
+        ctx.shadowBlur = 0;
+        ctx.restore();
+    }
+}
+
+// ─── 描画: 波乗りHUD（ラテラルバジェット + 初速）────────────
+function drawRidingHUD() {
+    if (gameState !== STATES.RIDING) return;
+
+    // Lateralゲージ幅: Wave Power に対して急激に拡大（Lv.10で画面の75%まで）
+    const barW = Math.round(Math.min(width * 0.75, 80 + Math.max(0, lateralBudgetMax - 60) / 180 * 420));
+    const barH = 14;
+    const bx   = width / 2 - barW / 2;
+    const by   = height - 72;
+    const frac = lateralBudgetMax > 0 ? lateralBudget / lateralBudgetMax : 0;
+    const col  = frac > 0.5 ? '#00FF88' : frac > 0.25 ? '#F4D03F' : '#FF4444';
+
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(bx - 2, by - 2, barW + 4, barH + 4);
+    ctx.fillStyle = col;
+    ctx.fillRect(bx, by, barW * frac, barH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth   = 1;
+    ctx.strokeRect(bx, by, barW, barH);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx.font      = '12px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('← LATERAL →', width / 2, by - 4);
+
+    // 初速表示（大きく）
+    const powerLevel = Math.min(10, Math.max(1, Math.round((rideSpeed - 1.0) / 3.0 * 9) + 1));
+    const speedColor = powerLevel <= 3 ? '#44AAFF' : powerLevel <= 6 ? '#F4D03F' : '#FF6633';
+    ctx.fillStyle   = speedColor;
+    ctx.shadowColor = speedColor; ctx.shadowBlur = 10;
+    ctx.font        = 'bold 22px Courier New';
+    ctx.fillText(`初速 ${rideSpeed.toFixed(1)}  Wave Lv.${powerLevel}`, width / 2, by - 26);
+    ctx.shadowBlur  = 0;
+}
+
+// ─── 描画: ライディング距離カウンター（キャンバス大表示）────
+function drawRidingCounter() {
+    if (gameState !== STATES.RIDING) return;
+    const m = Math.round(ridingDistance / 10);
+    ctx.save();
+    ctx.textAlign = 'center';
+    // ラベル
+    ctx.font      = 'bold 16px Courier New';
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.shadowColor = 'rgba(0,0,0,0.7)'; ctx.shadowBlur = 8;
+    ctx.fillText('DISTANCE', width / 2, height * 0.60 - 62);
+    // 数値（大）
+    ctx.font      = 'bold 88px Courier New';
+    ctx.fillStyle = 'rgba(255,255,255,0.95)';
+    ctx.shadowColor = 'rgba(0,0,0,0.85)'; ctx.shadowBlur = 20;
+    ctx.fillText(`${m}`, width / 2, height * 0.60);
+    // 単位
+    ctx.font      = 'bold 36px Courier New';
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.fillText('m', width / 2, height * 0.60 + 38);
+    ctx.shadowBlur = 0;
+    ctx.restore();
+}
+
+// ─── 描画: ライド終了スコア画面（SCORE_DISPLAY）────────────
+function drawScoreResult() {
+    if (gameState !== STATES.SCORE_DISPLAY) return;
+    ctx.save();
+    // 半透明オーバーレイ
+    ctx.fillStyle = 'rgba(0,0,20,0.74)';
+    ctx.fillRect(0, 0, width, height);
+    ctx.textAlign = 'center';
+    const t = Date.now();
+
+    // スコアメッセージ（パルス）
+    const pulse    = 1 + 0.055 * Math.sin(t / 200);
+    const msgColor = lastScore >= 300 ? '#FF6633'
+                   : lastScore >= 200 ? '#F4D03F'
+                   : lastScore >= 100 ? '#44FF88'
+                   : lastScore >= 50  ? '#44AAFF'
+                   :                    '#87CEEB';
+    ctx.font       = `bold italic ${Math.round(52 * pulse)}px 'Courier New'`;
+    ctx.shadowColor = msgColor; ctx.shadowBlur = 24;
+    ctx.fillStyle  = msgColor;
+    ctx.fillText(scoreMessage, width / 2, height / 2 - 120);
+
+    // 距離数値（最大表示）
+    ctx.font       = "bold 108px 'Courier New'";
+    ctx.shadowColor = 'white'; ctx.shadowBlur = 32;
+    ctx.fillStyle  = 'white';
+    ctx.fillText(`${lastScore} m`, width / 2, height / 2 + 20);
+
+    // 褒めコメント
+    ctx.font       = "20px 'Courier New'";
+    ctx.shadowColor = 'rgba(0,0,0,0.8)'; ctx.shadowBlur = 8;
+    ctx.fillStyle  = 'rgba(255,255,255,0.88)';
+    ctx.fillText(rideComment, width / 2, height / 2 + 80);
+
+    // 点滅する「Press any key」
+    if (Math.floor(t / 500) % 2 === 0) {
+        ctx.font      = '15px Courier New';
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = 'rgba(255,255,255,0.55)';
+        ctx.fillText('Press any key to continue', width / 2, height / 2 + 145);
+    }
+    ctx.shadowBlur = 0;
+    ctx.restore();
+}
+
+// ─── 描画: パドリングバー（2レーン縦流れ）────────────────────
+function drawPaddleBars() {
+    const judgmentY = height * JUDGMENT_Y_RATIO;
+    const laneL = width * (0.5 - LANE_OFFSET_RATIO); // 左レーンX
+    const laneR = width * (0.5 + LANE_OFFSET_RATIO); // 右レーンX
+    const laneW = PADDLE_BAR_W + 48;
+
+    // レーン背景（暗幕）
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(laneL - laneW / 2, 0, laneW, height);
+    ctx.fillRect(laneR - laneW / 2, 0, laneW, height);
+
+    // ─ 判定ライン ─
+    ctx.strokeStyle = 'rgba(244,208,63,0.85)';
+    ctx.lineWidth   = 3;
+    ctx.setLineDash([14, 7]);
+    ctx.beginPath(); ctx.moveTo(0, judgmentY); ctx.lineTo(width, judgmentY); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // ─ 判定パッド ─
+    const padData = [{ x: laneL, lane: -1, key: '←' }, { x: laneR, lane: 1, key: '→' }];
+    for (const pd of padData) {
+        const matchBar = ctwBars.find(b => b.lane === pd.lane && b.padFlash > 0);
+        const flashing = !!matchBar;
+        const ok       = matchBar ? matchBar.padSuccess : false;
+
+        ctx.beginPath();
+        ctx.arc(pd.x, judgmentY, 30, 0, Math.PI * 2);
+        ctx.fillStyle   = flashing ? (ok ? 'rgba(0,255,136,0.92)' : 'rgba(255,68,68,0.92)')
+                                   : 'rgba(244,208,63,0.22)';
+        ctx.fill();
+        ctx.strokeStyle = flashing ? (ok ? '#00FF88' : '#FF4444') : '#F4D03F';
+        ctx.lineWidth   = 3; ctx.stroke();
+
+        ctx.fillStyle = 'white';
+        ctx.font      = 'bold 19px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText(pd.key, pd.x, judgmentY + 7);
+    }
+
+    // ─ バー描画 ─
+    for (let i = 0; i < ctwBars.length; i++) {
+        const bar   = ctwBars[i];
+        const laneX = bar.lane === -1 ? laneL : laneR;
+        if (bar.y < -PADDLE_BAR_H - 10 || bar.y > height + PADDLE_BAR_H) continue;
+
+        const inJ  = Math.abs(bar.y - judgmentY) <= JUDGMENT_HALF_Y;
+        let color  = '#44AAFF';
+        if      (bar.success)                              color = '#00FF88';
+        else if (bar.resolved && !bar.success)             color = '#FF4444';
+        else if (i === ctwBarIdx && inJ && !bar.resolved)  color = '#F4D03F';
+
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.roundRect(laneX - PADDLE_BAR_W / 2, bar.y - PADDLE_BAR_H / 2, PADDLE_BAR_W, PADDLE_BAR_H, 9);
+        ctx.fill();
+
+        ctx.fillStyle = 'rgba(0,0,0,0.75)';
+        ctx.font      = 'bold 22px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText(bar.lane === -1 ? '←' : '→', laneX, bar.y + 8);
+    }
+
+    // ─ 進捗ドット（バー数に応じて可変、中央揃え）─
+    const _dotN = ctwBars.length;
+    const _dotStartX = width / 2 - (_dotN - 1) * 12; // 24px間隔で中央揃え
+    for (let i = 0; i < _dotN; i++) {
+        const bar = ctwBars[i];
+        ctx.beginPath();
+        ctx.arc(_dotStartX + i * 24, 95, 8, 0, Math.PI * 2);
+        ctx.fillStyle = (bar && bar.success)  ? '#00FF88'
+                      : (i === ctwBarIdx)     ? '#44AAFF'
+                      :                         'rgba(255,255,255,0.3)';
+        ctx.fill();
+    }
+
+    // ─ 操作説明 ─
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.font      = '14px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('← → でリズムよくパドリング！', width / 2, judgmentY + JUDGMENT_HALF_Y + 30);
+}
+
+// ─── 描画: テイクオフバー（中央縦流れ）──────────────────────
+function drawTakeoffBar() {
+    const bar       = ctwTakeoffBar;
+    if (!bar) return;
+    const judgmentY = height * JUDGMENT_Y_RATIO;
+    const laneX     = width / 2;
+    const laneW     = TAKEOFF_BAR_W + 60;
+
+    // 中央レーン背景
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(laneX - laneW / 2, 0, laneW, height);
+
+    // 判定ライン
+    ctx.strokeStyle = 'rgba(244,208,63,0.85)';
+    ctx.lineWidth   = 3;
+    ctx.setLineDash([14, 7]);
+    ctx.beginPath(); ctx.moveTo(0, judgmentY); ctx.lineTo(width, judgmentY); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 判定パッド（中央）
+    const inJ   = Math.abs(bar.y - judgmentY) <= JUDGMENT_HALF_Y;
+    const flash = bar.flashTimer > 0;
+    ctx.beginPath();
+    ctx.arc(laneX, judgmentY, 34, 0, Math.PI * 2);
+    ctx.fillStyle   = flash ? (bar.flashSuccess ? 'rgba(0,255,136,0.92)' : 'rgba(255,68,68,0.92)')
+                            : (inJ ? 'rgba(255,140,0,0.5)' : 'rgba(244,208,63,0.2)');
+    ctx.fill();
+    ctx.strokeStyle = flash ? (bar.flashSuccess ? '#00FF88' : '#FF4444') : '#F4D03F';
+    ctx.lineWidth   = 3; ctx.stroke();
+
+    ctx.fillStyle = 'white';
+    ctx.font      = 'bold 12px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('SPACE', laneX, judgmentY + 5);
+
+    // バー本体
+    let barColor = '#FF8C00';
+    if (flash) barColor = bar.flashSuccess ? '#00FF88' : '#FF4444';
+    ctx.fillStyle = barColor;
+    ctx.beginPath();
+    ctx.roundRect(laneX - TAKEOFF_BAR_W / 2, bar.y - TAKEOFF_BAR_H / 2, TAKEOFF_BAR_W, TAKEOFF_BAR_H, 10);
+    ctx.fill();
+
+    ctx.fillStyle = '#fff';
+    ctx.font      = 'bold 17px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('SPACE!', laneX, bar.y + 7);
+
+    // 操作説明
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.font      = '14px Courier New';
+    ctx.fillText('タイミングよく SPACE !', width / 2, judgmentY + JUDGMENT_HALF_Y + 30);
+}
+
+// ─── 描画: Catch the Wave フラッシュ ─────────────────────────
+function drawCatchTheWaveFlash() {
+    const alpha = Math.min(1, ctwTimer / 35);
+    // Wave Power レベル計算（1〜10）
+    const powerLevel = Math.min(10, Math.max(1, Math.round((rideSpeed - 1.0) / 3.0 * 9) + 1));
+
+    ctx.save();
+    ctx.globalAlpha = alpha * 0.78;
+    ctx.fillStyle   = '#001133';
+    ctx.fillRect(0, height / 2 - 120, width, 240);
+    ctx.globalAlpha = alpha;
+    ctx.textAlign   = 'center';
+    ctx.shadowColor = '#44AAFF'; ctx.shadowBlur = 24;
+    ctx.fillStyle   = '#44AAFF';
+    ctx.font        = `bold italic 56px 'Courier New'`;
+    ctx.fillText('Catch the Wave!', width / 2, height / 2 - 20);
+    ctx.shadowBlur  = 0;
+    ctx.fillStyle   = 'rgba(255,255,255,0.6)';
+    ctx.font        = 'bold 17px Courier New';
+    ctx.fillText('— Wave paused —', width / 2, height / 2 + 18);
+
+    // Wave Power バー（10段階）
+    ctx.fillStyle = '#F4D03F';
+    ctx.font      = 'bold 15px Courier New';
+    ctx.fillText('Wave Power', width / 2, height / 2 + 52);
+
+    const barW = 240, barH = 22;
+    const barX = width / 2 - barW / 2, barY = height / 2 + 62;
+    // バー背景
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.fillRect(barX, barY, barW, barH);
+    // バー本体（レベルで色変化）
+    const barColor = powerLevel <= 3 ? '#44AAFF'
+                   : powerLevel <= 6 ? '#F4D03F'
+                   : '#FF6633';
+    ctx.fillStyle = barColor;
+    ctx.fillRect(barX, barY, barW * (powerLevel / 10), barH);
+    // 枠線
+    ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+    ctx.lineWidth   = 1;
+    ctx.strokeRect(barX, barY, barW, barH);
+    // レベル表示テキスト
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.font      = 'bold 14px Courier New';
+    ctx.fillText(`Lv.${powerLevel} / 10`, width / 2, barY + barH + 20);
+
+    ctx.restore();
+}
+
+// ─── メイン描画ループ ─────────────────────────────────────────
+function draw() {
+    // ─── SPOT_SELECT: 入力処理 + 専用描画 ────────────────────────
+    if (gameState === STATES.SPOT_SELECT) {
+        if (keysJustPressed.has('ArrowLeft'))  selectedSpot = (selectedSpot + SPOTS.length - 1) % SPOTS.length;
+        if (keysJustPressed.has('ArrowRight')) selectedSpot = (selectedSpot + 1) % SPOTS.length;
+        if (keysJustPressed.has('Space')) initSession();
+        keysJustPressed.clear();
+        drawSpotSelect();
+        requestAnimationFrame(draw);
+        return;
+    }
+
+    // ─── マルチウェーブ更新 ───────────────────────────────────────
+    for (const wave of waves) { wave.bottomY += wave.speed * slowFactor; }
+    waves = waves.filter(w => w.bottomY <= height + 300);
+    maybeSpawnWave();
+    for (const wave of waves) updateWaveProps(wave);
+    activeWave = findActiveWave();
+
+    // レガシーグローバル更新 (旧コードとの互換性)
+    if (activeWave) {
+        waveBottomY       = activeWave.bottomY;
+        currentWaveTopY   = activeWave.topY;
+        currentWaveHeight = activeWave.height;
+        currentWidth      = activeWave.width;
+        waveBreakProgress = activeWave.breakProgress;
+        currentWaveBreakY = activeWave.breakY;
+        isFullyBroken     = activeWave.isFullyBroken;
+    } else {
+        waveBottomY       = -1000;
+        currentWaveTopY   = -1000;
+        currentWaveHeight = WAVE_HEIGHT_BASE;
+        currentWidth      = 0;
+        waveBreakProgress = 0;
+        currentWaveBreakY = -1000;
+        isFullyBroken     = false;
+    }
+
+    update(); // ← 波の状態が確定してから更新
+
+    // 背景
+    ctx.fillStyle = '#00BFFF'; ctx.fillRect(0, 0, width, height);
+    ctx.fillStyle = '#F4D03F'; ctx.fillRect(0, height - beachHeight, width, beachHeight);
+
+    // 全波描画
+    for (const wave of waves) drawWave(wave);
+
+    // サーファー描画（ダックダイブ中は非表示）
+    const isDiving = duckDiveTimer > 0 && gameState === STATES.GET_OUT;
+    if (!isDiving) {
+        let imgKey = 'BACK';
+        if      (gameState === STATES.WIPEOUT)                                             imgKey = 'WIPEOUT';
+        else if (gameState === STATES.TAKEOFF_TRY)                                         imgKey = 'FRONT';
+        else if (gameState === STATES.RIDING)                                              imgKey = 'RIDING';
+        else if (gameState === STATES.PADDLING_TRY || gameState === STATES.CATCH_THE_WAVE) imgKey = 'FRONT';
+        else {
+            // 波の面（弧より下かつ波底より上）にいる場合のみ正面
+            // 沖側（弧より上）は空洞・裏面ともにすべて BACK
+            for (const wave of waves) {
+                const _d = Math.abs(surferX - wave.centerX);
+                if (wave.width > 0 && _d < wave.width / 2) {
+                    const _topAtX = wave.topY + Math.pow(_d / (wave.width / 2), 2) * wave.height;
+                    if (surferY >= _topAtX && surferY < wave.bottomY) { imgKey = 'FRONT'; break; }
+                }
+            }
+        }
+
+        const isFlip = Math.floor(Date.now() / 500) % 2 === 0;
+        const img    = loadedImgs[imgKey];
+
+        ctx.save();
+        ctx.translate(surferX, surferY);
+        if (isFlip) ctx.scale(-1, 1);
+        if (img) {
+            const s = CHARACTER_SCALE;
+            const w = img.width * s, h = img.height * s;
+            if (SHOW_HALO) {
+                ctx.shadowColor = (gameState === STATES.WIPEOUT) ? '#FF4444' : 'white';
+                ctx.shadowBlur  = 5;
+                for (let i = 0; i < 4; i++) ctx.drawImage(img, -w / 2, -h / 2, w, h);
+            }
+            ctx.shadowBlur = 0;
+            ctx.drawImage(img, -w / 2, -h / 2, w, h);
+        } else {
+            ctx.fillStyle = 'red'; ctx.fillRect(-15, -15, 30, 30);
+        }
+        ctx.restore();
+    } else {
+        // ダックダイブ中: 水面に波紋エフェクト
+        const r = 18 + (DUCK_DIVE_FRAMES - duckDiveTimer) * 0.3;
+        ctx.beginPath();
+        ctx.arc(surferX, surferY, r, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+        ctx.lineWidth   = 2;
+        ctx.stroke();
+    }
+
+    // ! ガイド（テイクオフ可能時）
+    if (gameState === STATES.WAITING && activeWave && !activeWave.isFullyBroken) {
+        const _adx = Math.abs(surferX - activeWave.centerX);
+        if (_adx < activeWave.width / 2
+         && surferY >= activeWave.breakY
+         && surferY <  activeWave.bottomY) {
+            ctx.fillStyle = 'white'; ctx.font = 'bold 26px Arial'; ctx.textAlign = 'center';
+            ctx.fillText('!', surferX, surferY - 32);
+        }
+    }
+
+    // BEACH 操作説明
+    if (gameState === STATES.BEACH) {
+        ctx.textAlign = 'center';
+        ctx.fillStyle = 'rgba(255,255,255,0.75)';
+        ctx.font      = '16px Courier New';
+        ctx.fillText('← → ポジションを決める   SPACE でパドルアウト！', width / 2, height - beachHeight - 70);
+    }
+
+    // GET_OUT ダックダイブ説明
+    if (gameState === STATES.GET_OUT) {
+        ctx.textAlign = 'center';
+        ctx.fillStyle = 'rgba(255,255,255,0.65)';
+        ctx.font      = '14px Courier New';
+        ctx.fillText('↑ ダックダイブ   ← → 左右   ↓ 後退', width / 2, height - beachHeight - 70);
+    }
+
+    // CTW 系 UI
+    if (gameState === STATES.CATCH_THE_WAVE) drawCatchTheWaveFlash();
+    if (gameState === STATES.PADDLING_TRY)   drawPaddleBars();
+    if (gameState === STATES.TAKEOFF_TRY)    drawTakeoffBar();
+
+    // 波乗り距離カウンター（RIDING 中はキャンバスに大表示）
+    drawRidingCounter();
+
+    // 波乗りHUD（Lateralゲージ・初速）
+    drawRidingHUD();
+
+    // ステートラベル（全ステート対応）
+    drawStateLabel();
+
+    // ライド終了スコア画面（キー待ちパネル）
+    drawScoreResult();
+
+    // タッチUI（ゾーンヒント + Spaceボタン）※最前面に描画
+    drawTouchUI();
+
+    requestAnimationFrame(draw);
+}
+
+function startGame() { init(); draw(); }
+prepareAssets();
+window.addEventListener('resize', init);
+</script>
+</body>
+</html>

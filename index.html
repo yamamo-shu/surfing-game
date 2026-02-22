@@ -233,7 +233,8 @@ let _prevCanCatch    = false;   // 前フレームの _canCatch（リセット�
 let catchTapCount    = 0;       // 波乗り連打カウント
 let catchTapRequired = 2;       // 必要タップ数（波サイズで決まる: Lv1=2〜Lv10=10）
 let _spaceBtn    = null;    // 現フレームのSpaceボタン領域 {x,y,w,h,label,color}
-let _backBtn     = null;    // 現フレームの「戻る」ボタン領域
+let _backBtn      = null;    // 現フレームの「戻る」ボタン領域
+let _spotTabRects = [];      // スポットタブの矩形（タッチ判定用）
 const _touchMap  = new Map(); // touchId → 'drag' | key | null
 const _touchPos  = new Map(); // touchId → {x, y}  ドラッグ追跡
 let _dragDirKey  = null;      // 現在アクティブなドラッグ方向キー
@@ -252,6 +253,21 @@ function _onTouchStart(e) {
         // 「戻る」ボタン（SPOT_SELECT 以外で表示）
         if (gameState !== STATES.SPOT_SELECT && _inRect(_backBtn, sx, sy)) {
             gameState = STATES.SPOT_SELECT;
+            _touchMap.set(t.identifier, null);
+            continue;
+        }
+
+        // SPOT_SELECT: タブタップでスポット変更、STARTボタンタップでStart
+        if (gameState === STATES.SPOT_SELECT) {
+            let hitTab = false;
+            for (const tab of _spotTabRects) {
+                if (_inRect(tab, sx, sy)) {
+                    selectedSpot = tab.idx;
+                    hitTab = true;
+                    break;
+                }
+            }
+            if (!hitTab && _inRect(_spaceBtn, sx, sy)) keysJustPressed.add('Space');
             _touchMap.set(t.identifier, null);
             continue;
         }
@@ -746,8 +762,10 @@ function drawSpotSelect() {
     const tabH    = Math.max(40, Math.min(54, height * 0.072));
     const tabY    = isPortrait ? height * 0.26 : height * 0.33;
     const tabFS   = Math.max(12, Math.min(17, tabW * 0.16));
+    _spotTabRects = []; // タッチ判定用に更新
     for (let i = 0; i < SPOTS.length; i++) {
         const tx  = panelX + i * (tabW + tabGap);
+        _spotTabRects.push({ x: tx, y: tabY, w: tabW, h: tabH, idx: i });
         const sel = i === selectedSpot;
         ctx.fillStyle = sel ? '#44AAFF' : 'rgba(255,255,255,0.12)';
         ctx.beginPath(); ctx.roundRect(tx, tabY, tabW, tabH, 8); ctx.fill();
@@ -1147,7 +1165,7 @@ function drawTouchUI() {
         const bbW = Math.max(64, Math.min(88, width * 0.18));
         const bbH = Math.max(34, Math.min(44, height * 0.058));
         const bbX = 12;
-        const bbY = height - beachHeight - bbH - 10;
+        const bbY = height - bbH - 10; // 砂浜の中（画面最下部付近）
         _backBtn  = { x: bbX, y: bbY, w: bbW, h: bbH };
         ctx.save();
         ctx.fillStyle   = 'rgba(0,0,0,0.55)';

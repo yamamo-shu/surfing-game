@@ -196,19 +196,27 @@ let waveSetTimer     = 0;    // 次の spawn までの残フレーム
 let waveSetCooldown  = 60;   // セット間の待機残フレーム（初期: 60f で即座に1セット目）
 
 // セッション固定パラメータ（initSession() で決定、ゲーム中は不変）
-let selectedSpot       = 0;        // 0=Bali, 1=Chiba-Kita, 2=Shonan
+let selectedSpot       = 0;        // 0=Shonan, 1=Chiba-Kita, 2=Bali
 let sessionPeakXs      = [];       // ピーク X 座標配列
 let sessionWaveCount   = 2;        // セットあたりの波数
 let sessionSetInterval = 300;      // セット間隔 (フレーム)
 
+// ─── カメラ / ワールドサイズ ────────────────────────────────
+// スマホ縦持ちでも 16:9 横長フィールドを維持し、カメラがサーファーを追う
+let WORLD_W = 960;  // ゲームワールド幅 (init()で更新)
+let camX    = 0;    // 水平カメラオフセット (0〜WORLD_W-width)
+
 // ─── 初期化 ─────────────────────────────────────────────────
 function init() {
-    width  = window.innerWidth;
-    height = window.innerHeight;
+    width   = window.innerWidth;
+    height  = window.innerHeight;
+    // ゲームワールドは常に 16:9 以上の横幅を確保
+    WORLD_W = Math.max(width, Math.round(height * 16 / 9));
     canvas.width  = width;
     canvas.height = height;
-    surferX = width / 2;
+    surferX = WORLD_W / 2;
     surferY = height - beachHeight - 50;
+    camX    = Math.max(0, Math.min(WORLD_W - width, surferX - width / 2));
 }
 
 window.addEventListener('keydown', (e) => {
@@ -218,16 +226,13 @@ window.addEventListener('keydown', (e) => {
 window.addEventListener('keyup',   (e) => { keys[e.code] = false; });
 
 // ─── スマホ タッチ サポート ──────────────────────────────────
-let _canCatch  = false;   // WAITINGでのテイクオフ可能フラグ（タッチUI用）
-let _spaceBtn  = null;    // 現フレームのSpaceボタン領域 {x,y,w,h,label,color}
-const _touchMap = new Map(); // touchId → key
-
-function _touchZoneKey(tx, ty) {
-    // 画面を対角線で4分割: |dy|>|dx| なら上/下、そうでなければ左/右
-    const dx = tx - width / 2, dy = ty - height / 2;
-    if (Math.abs(dy) > Math.abs(dx)) return dy < 0 ? 'ArrowUp' : 'ArrowDown';
-    return dx < 0 ? 'ArrowLeft' : 'ArrowRight';
-}
+let _canCatch    = false;   // WAITINGでのテイクオフ可能フラグ（タッチUI用）
+let _spaceBtn    = null;    // 現フレームのSpaceボタン領域 {x,y,w,h,label,color}
+const _touchMap  = new Map(); // touchId → 'drag' | key | null
+const _touchPos  = new Map(); // touchId → {x, y}  ドラッグ追跡
+let _dragDirKey  = null;      // 現在アクティブなドラッグ方向キー
+let _lastTapTime = 0;         // ダブルタップ検出用
+let _lastTapX    = 0, _lastTapY = 0;
 
 function _inRect(r, tx, ty) {
     return r && tx >= r.x && tx <= r.x + r.w && ty >= r.y && ty <= r.y + r.h;
@@ -236,34 +241,118 @@ function _inRect(r, tx, ty) {
 function _onTouchStart(e) {
     e.preventDefault();
     for (const t of e.changedTouches) {
-        const tx = t.clientX, ty = t.clientY;
+        const sx = t.clientX, sy = t.clientY; // スクリーン座標
 
-        // SCORE_DISPLAY はどこでもタップで続行
+        // SCORE_DISPLAY: どこでもタップで続行
         if (gameState === STATES.SCORE_DISPLAY) {
             keysJustPressed.add('Space');
             _touchMap.set(t.identifier, null);
             continue;
         }
 
-        // Spaceボタン領域を優先判定
-        const key = _inRect(_spaceBtn, tx, ty) ? 'Space' : _touchZoneKey(tx, ty);
-        if (key && !keys[key]) keysJustPressed.add(key);
-        if (key) keys[key] = true;
-        _touchMap.set(t.identifier, key);
+        // ダブルタップ検出
+        const now = Date.now();
+        const isDouble = (now - _lastTapTime < 320)
+                      && Math.hypot(sx - _lastTapX, sy - _lastTapY) < 70;
+        _lastTapTime = now; _lastTapX = sx; _lastTapY = sy;
+
+        if (isDouble) {
+            if (gameState === STATES.GET_OUT) {
+                // ダックダイブ
+                keysJustPressed.add('ArrowUp');
+                _touchMap.set(t.identifier, null);
+                _lastTapTime = 0; // リセットして3連タップ防止
+                continue;
+            }
+            if (gameState === STATES.WAITING && _canCatch) {
+                // 波に乗る
+                keysJustPressed.add('Space');
+                _touchMap.set(t.identifier, null);
+                _lastTapTime = 0;
+                continue;
+            }
+        }
+
+        // PADDLING_TRY: 左右の判定円を直接タップ
+        if (gameState === STATES.PADDLING_TRY) {
+            const lL = width * (0.5 - LANE_OFFSET_RATIO);
+            const lR = width * (0.5 + LANE_OFFSET_RATIO);
+            const jY = height * JUDGMENT_Y_RATIO;
+            const R  = Math.max(55, width * 0.14); // タップ当たり判定半径
+            if (Math.hypot(sx - lL, sy - jY) <= R) keysJustPressed.add('ArrowLeft');
+            if (Math.hypot(sx - lR, sy - jY) <= R) keysJustPressed.add('ArrowRight');
+            _touchMap.set(t.identifier, null);
+            _touchPos.set(t.identifier, {x: sx, y: sy});
+            continue;
+        }
+
+        // TAKEOFF_TRY: TAKE OFF ボタン
+        if (gameState === STATES.TAKEOFF_TRY && _inRect(_spaceBtn, sx, sy)) {
+            keysJustPressed.add('Space');
+            _touchMap.set(t.identifier, null);
+            continue;
+        }
+
+        // その他の Space ボタン（SPOT_SELECT / BEACH / WAITING _canCatch）
+        if (_inRect(_spaceBtn, sx, sy)) {
+            keysJustPressed.add('Space');
+            _touchMap.set(t.identifier, null);
+            continue;
+        }
+
+        // デフォルト: 相対ドラッグで方向入力
+        _touchMap.set(t.identifier, 'drag');
+        _touchPos.set(t.identifier, {x: sx, y: sy});
+    }
+}
+
+function _onTouchMove(e) {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+        const sx = t.clientX, sy = t.clientY;
+        if (_touchMap.get(t.identifier) !== 'drag') {
+            _touchPos.set(t.identifier, {x: sx, y: sy});
+            continue;
+        }
+        const last = _touchPos.get(t.identifier);
+        if (!last) { _touchPos.set(t.identifier, {x: sx, y: sy}); continue; }
+
+        const dx = sx - last.x, dy = sy - last.y;
+
+        // 直前のドラッグキーを解除してから新しい方向を適用
+        if (_dragDirKey) { keys[_dragDirKey] = false; }
+        _dragDirKey = null;
+
+        const thr = 5;
+        if (Math.abs(dx) > thr || Math.abs(dy) > thr) {
+            if (Math.abs(dx) >= Math.abs(dy)) {
+                _dragDirKey = dx < 0 ? 'ArrowLeft' : 'ArrowRight';
+            } else if (dy > thr) {
+                _dragDirKey = 'ArrowDown';
+                // 上方向ドラッグは使わない（ダックダイブ=ダブルタップ）
+            }
+            if (_dragDirKey) keys[_dragDirKey] = true;
+        }
+        _touchPos.set(t.identifier, {x: sx, y: sy});
     }
 }
 
 function _onTouchEnd(e) {
     e.preventDefault();
     for (const t of e.changedTouches) {
-        const key = _touchMap.get(t.identifier);
-        if (key) keys[key] = false;
+        if (_touchMap.get(t.identifier) === 'drag') {
+            if (_dragDirKey) { keys[_dragDirKey] = false; _dragDirKey = null; }
+        } else {
+            const key = _touchMap.get(t.identifier);
+            if (key) keys[key] = false;
+        }
         _touchMap.delete(t.identifier);
+        _touchPos.delete(t.identifier);
     }
 }
 
-// canvasにタッチイベント登録（startGame後に追加するため window 経由でも可）
 window.addEventListener('touchstart',  _onTouchStart, { passive: false });
+window.addEventListener('touchmove',   _onTouchMove,  { passive: false });
 window.addEventListener('touchend',    _onTouchEnd,   { passive: false });
 window.addEventListener('touchcancel', _onTouchEnd,   { passive: false });
 
@@ -464,9 +553,9 @@ function initSession() {
                    + Math.floor(Math.random() * (spot.peakCountRange[1] - spot.peakCountRange[0] + 1));
     sessionPeakXs = [];
     for (let i = 0; i < numPeaks; i++) {
-        const baseX  = width * 0.2 + width * 0.6 * (i + 0.5) / numPeaks;
+        const baseX  = WORLD_W * 0.2 + WORLD_W * 0.6 * (i + 0.5) / numPeaks;
         const jitter = (Math.random() - 0.5) * spot.terrainSpread;
-        sessionPeakXs.push(Math.max(width * 0.15, Math.min(width * 0.85, baseX + jitter)));
+        sessionPeakXs.push(Math.max(WORLD_W * 0.15, Math.min(WORLD_W * 0.85, baseX + jitter)));
     }
     // セットあたり波数（セッション固定）
     const [wMin, wMax] = spot.waveCountRange;
@@ -478,7 +567,7 @@ function initSession() {
     waves = []; activeWave = null;
     waveSetRemaining = 0; waveSetTimer = 0; waveSetCooldown = 60;
     // プレイヤーとスコアをリセット
-    surferX = width / 2;
+    surferX = WORLD_W / 2;
     surferY = height - beachHeight - 50;
     bestScore = 0;
     gameState = STATES.BEACH;
@@ -500,7 +589,7 @@ function spawnWave(peakIdx = -1) {
                     ? sessionPeakXs[peakIdx]
                     : sessionPeakXs[Math.floor(Math.random() * sessionPeakXs.length)];
     const spread    = SPOTS[selectedSpot].terrainSpread;
-    const centerX   = Math.max(width * 0.15, Math.min(width * 0.85,
+    const centerX   = Math.max(WORLD_W * 0.15, Math.min(WORLD_W * 0.85,
                           peak + (Math.random() - 0.5) * spread * 0.5));
     // 大きい波ほど速い: Level1=×0.3(0.75px/f), Level10=×1.0(2.5px/f)
     const sizeFrac = (sizeLevel - 1) / 9;
@@ -537,7 +626,7 @@ function updateWaveProps(wave) {
                        + (wave.sizeLevel - 1) / 9 * (WAVE_HEIGHT_MAX - WAVE_HEIGHT_BASE) * p;
     // 横幅: 大きい波ほど広く（Level1=25%、Level10=95%）、進行とともに拡大
     const sizeFrac = (wave.sizeLevel - 1) / 9;
-    wave.width         = width * (0.25 + 0.70 * sizeFrac) * (0.35 + 0.65 * p);
+    wave.width         = WORLD_W * (0.25 + 0.70 * sizeFrac) * (0.35 + 0.65 * p);
     wave.topY          = wave.bottomY - wave.height;
     const bp           = p > 0.3 ? (p - 0.3) / 0.65 : 0;
     wave.breakProgress = bp;
@@ -581,8 +670,11 @@ function checkWipeoutAll() {
 
 // ─── 波の描画 ─────────────────────────────────────────────────
 function drawWave(wave) {
-    const halfW = wave.width / 2;
-    for (let x = 0; x < width; x += gridSize) {
+    const halfW  = wave.width / 2;
+    // 可視範囲のみ描画（パフォーマンス最適化）
+    const xStart = Math.max(0, Math.floor((wave.centerX - halfW - gridSize) / gridSize) * gridSize);
+    const xEnd   = Math.min(WORLD_W, wave.centerX + halfW + gridSize);
+    for (let x = xStart; x < xEnd; x += gridSize) {
         const dist = Math.abs(x - wave.centerX);
         if (dist >= halfW) continue;
         const arc  = Math.pow(dist / halfW, 2) * wave.height;
@@ -605,45 +697,60 @@ function drawSpotSelect() {
     ctx.fillStyle = grad; ctx.fillRect(0, 0, width, height);
     ctx.fillStyle = '#F4D03F'; ctx.fillRect(0, height - beachHeight, width, beachHeight);
 
+    // ─ レスポンシブ基準値 ─
+    const isPortrait = height > width;
+    const sidePad    = Math.max(16, width * 0.04);
+    const panelW     = width - sidePad * 2;
+    const panelX     = sidePad;
+
     // タイトル
+    const titleSize = Math.max(22, Math.min(52, width * 0.085));
+    const subSize   = Math.max(13, Math.min(18, width * 0.038));
     ctx.textAlign = 'center';
-    ctx.font = "bold italic 52px 'Courier New'";
-    ctx.shadowColor = '#44AAFF'; ctx.shadowBlur = 24;
+    ctx.font = `bold italic ${titleSize}px 'Courier New'`;
+    ctx.shadowColor = '#44AAFF'; ctx.shadowBlur = 20;
     ctx.fillStyle = '#44AAFF';
-    ctx.fillText('Yamamossan Surfing', width / 2, height * 0.14);
+    ctx.fillText('Yamamossan Surfing', width / 2, isPortrait ? height * 0.11 : height * 0.14);
     ctx.shadowBlur = 0;
     ctx.fillStyle = 'rgba(255,255,255,0.7)';
-    ctx.font = "18px 'Courier New'";
-    ctx.fillText('〜 Select Surf Spot 〜', width / 2, height * 0.14 + 50);
+    ctx.font = `${subSize}px 'Courier New'`;
+    ctx.fillText('〜 Select Surf Spot 〜', width / 2,
+        (isPortrait ? height * 0.11 : height * 0.14) + titleSize * 1.0);
 
     // スポットタブ
-    const tabW = 180, tabH = 50, tabY = height * 0.33, tabGap = 28;
-    const totalW = SPOTS.length * tabW + (SPOTS.length - 1) * tabGap;
-    const tabStartX = width / 2 - totalW / 2;
+    const tabGap  = Math.max(6, Math.min(20, width * 0.025));
+    const tabW    = Math.floor((panelW - (SPOTS.length - 1) * tabGap) / SPOTS.length);
+    const tabH    = Math.max(40, Math.min(54, height * 0.072));
+    const tabY    = isPortrait ? height * 0.26 : height * 0.33;
+    const tabFS   = Math.max(12, Math.min(17, tabW * 0.16));
     for (let i = 0; i < SPOTS.length; i++) {
-        const tx  = tabStartX + i * (tabW + tabGap);
+        const tx  = panelX + i * (tabW + tabGap);
         const sel = i === selectedSpot;
         ctx.fillStyle = sel ? '#44AAFF' : 'rgba(255,255,255,0.12)';
         ctx.beginPath(); ctx.roundRect(tx, tabY, tabW, tabH, 8); ctx.fill();
         if (sel) { ctx.strokeStyle = '#88CCFF'; ctx.lineWidth = 2; ctx.stroke(); }
         ctx.fillStyle = sel ? '#001133' : 'rgba(255,255,255,0.75)';
-        ctx.font = sel ? "bold 17px 'Courier New'" : "15px 'Courier New'";
-        ctx.fillText(SPOTS[i].nameJP, tx + tabW / 2, tabY + 32);
+        ctx.font = sel ? `bold ${tabFS}px 'Courier New'` : `${tabFS - 1}px 'Courier New'`;
+        ctx.textAlign = 'center';
+        ctx.fillText(SPOTS[i].nameJP, tx + tabW / 2, tabY + tabH * 0.64);
     }
 
     // 詳細パネル
     const spot = SPOTS[selectedSpot];
-    const detY = height * 0.33 + tabH + 20;
+    const detY = tabY + tabH + 12;
+    const detH = Math.min(220, height * (isPortrait ? 0.38 : 0.32));
     ctx.fillStyle = 'rgba(0,10,50,0.75)';
-    ctx.beginPath(); ctx.roundRect(width / 2 - 310, detY, 620, 220, 14); ctx.fill();
+    ctx.beginPath(); ctx.roundRect(panelX, detY, panelW, detH, 14); ctx.fill();
     ctx.strokeStyle = 'rgba(68,170,255,0.3)'; ctx.lineWidth = 1; ctx.stroke();
 
+    const nameFS = Math.max(16, Math.min(22, panelW * 0.055));
+    const descFS = Math.max(11, Math.min(14, panelW * 0.032));
     ctx.fillStyle = '#F4D03F';
-    ctx.font = "bold 22px 'Courier New'"; ctx.textAlign = 'center';
-    ctx.fillText(spot.nameJP, width / 2, detY + 36);
+    ctx.font = `bold ${nameFS}px 'Courier New'`; ctx.textAlign = 'center';
+    ctx.fillText(spot.nameJP, panelX + panelW / 2, detY + nameFS * 1.6);
     ctx.fillStyle = 'rgba(255,255,255,0.75)';
-    ctx.font = "13px 'Courier New'";
-    ctx.fillText(spot.desc, width / 2, detY + 62);
+    ctx.font = `${descFS}px 'Courier New'`;
+    ctx.fillText(spot.desc, panelX + panelW / 2, detY + nameFS * 1.6 + descFS * 1.7);
 
     // パラメータバー（3本）
     const avgSz  = spot.sizeWeights.reduce((s, w, i) => s + w * (i + 1), 0) / 10;
@@ -652,29 +759,36 @@ function drawSpotSelect() {
     const avgInt = (spot.setIntervalRange[0] + spot.setIntervalRange[1]) / 2;
     const freq   = Math.min(1, avgCnt / 4 * (300 / avgInt));
     const bars   = [
-        { label: '波サイズ',   val: avgSz,  color: '#44AAFF' },
+        { label: '波サイズ',    val: avgSz, color: '#44AAFF' },
         { label: '地形の定点性', val: terr,  color: '#00FF88' },
-        { label: '波の頻度',   val: freq,  color: '#F4D03F' },
+        { label: '波の頻度',    val: freq,  color: '#F4D03F' },
     ];
+    const labelFS  = Math.max(10, Math.min(13, panelW * 0.028));
+    const barRowH  = Math.max(30, Math.min(40, detH * 0.17));
+    const labelW   = Math.min(90, panelW * 0.30);
+    const barX     = panelX + labelW + 8;
+    const barW     = panelW - labelW - 14 - 36;
+    const barH     = Math.max(12, Math.min(18, barRowH * 0.48));
+    const barsTopY = detY + nameFS * 1.6 + descFS * 1.7 + descFS * 1.4;
     for (let i = 0; i < bars.length; i++) {
-        const by = detY + 88 + i * 38;
-        ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.font = "12px 'Courier New'";
+        const by = barsTopY + i * barRowH;
+        ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.font = `${labelFS}px 'Courier New'`;
         ctx.textAlign = 'right';
-        ctx.fillText(bars[i].label, width / 2 - 100, by + 12);
-        const bx = width / 2 - 88, bw = 200;
-        ctx.fillStyle = 'rgba(255,255,255,0.15)'; ctx.fillRect(bx, by, bw, 16);
-        ctx.fillStyle = bars[i].color;             ctx.fillRect(bx, by, bw * bars[i].val, 16);
+        ctx.fillText(bars[i].label, panelX + labelW, by + barH * 0.85);
+        ctx.fillStyle = 'rgba(255,255,255,0.15)'; ctx.fillRect(barX, by, barW, barH);
+        ctx.fillStyle = bars[i].color;             ctx.fillRect(barX, by, barW * bars[i].val, barH);
         ctx.strokeStyle = 'rgba(255,255,255,0.2)'; ctx.lineWidth = 1;
-        ctx.strokeRect(bx, by, bw, 16);
+        ctx.strokeRect(barX, by, barW, barH);
         ctx.textAlign = 'left';
-        ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.font = "11px 'Courier New'";
-        ctx.fillText(`${Math.round(bars[i].val * 100)}%`, bx + bw + 6, by + 12);
+        ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.font = `${labelFS - 1}px 'Courier New'`;
+        ctx.fillText(`${Math.round(bars[i].val * 100)}%`, barX + barW + 5, by + barH * 0.85);
     }
 
     // 点滅する操作説明
     const alpha = 0.5 + 0.5 * Math.sin(Date.now() / 500);
     ctx.fillStyle = `rgba(255,255,255,${alpha.toFixed(2)})`;
-    ctx.font = "15px 'Courier New'"; ctx.textAlign = 'center';
+    ctx.font = `${Math.max(12, Math.min(15, width * 0.034))}px 'Courier New'`;
+    ctx.textAlign = 'center';
     ctx.fillText('← → でスポット変更', width / 2, height - beachHeight - 45);
 
     // タッチUI（スタートボタン）
@@ -801,7 +915,7 @@ function update() {
         }
     }
 
-    surferX = Math.max(20, Math.min(width - 20, surferX));
+    surferX = Math.max(20, Math.min(WORLD_W - 20, surferX));
     surferY = Math.max(20, Math.min(height - 10, surferY));
 
     // 白波の衝突判定（WAITING のみ、全波チェック）
@@ -857,52 +971,46 @@ function drawStateLabel() {
 }
 
 // ─── 描画: タッチUI（スマホ対応）────────────────────────────
-// ・対角線4分割ゾーンのヒント
+// ・スワイプ方向ヒント（スワイプ操作が有効なステートのみ、薄く表示）
 // ・ステートに応じた Space ボタン（TAKEOFF_TRY は大型 TAKE OFF ボタン）
 function drawTouchUI() {
     _spaceBtn = null; // 毎フレームリセット
 
-    // ── 対角線ゾーンヒント（方向入力が有効なステートのみ）──
-    const showZones = gameState === STATES.GET_OUT
-                   || gameState === STATES.WAITING
-                   || gameState === STATES.RIDING
-                   || gameState === STATES.BEACH
-                   || gameState === STATES.PADDLING_TRY;
-    if (showZones) {
+    // ── スワイプヒント（方向入力が有効なステートのみ）──
+    const showSwipeHint = gameState === STATES.GET_OUT
+                       || gameState === STATES.WAITING
+                       || gameState === STATES.RIDING
+                       || gameState === STATES.BEACH;
+    if (showSwipeHint) {
         ctx.save();
-        ctx.strokeStyle = 'rgba(255,255,255,0.07)';
-        ctx.lineWidth = 1;
-        ctx.setLineDash([8, 10]);
-        ctx.beginPath();
-        ctx.moveTo(0, 0);       ctx.lineTo(width, height);
-        ctx.moveTo(width, 0);   ctx.lineTo(0, height);
-        ctx.stroke();
-        ctx.setLineDash([]);
-        // 4隅の方向ラベル
-        const pad = 18, fs = 13;
-        ctx.font = `${fs}px Courier New`;
-        ctx.fillStyle = 'rgba(255,255,255,0.18)';
+        const hintFS = Math.max(11, Math.min(14, width * 0.030));
+        ctx.font = `${hintFS}px Courier New`;
+        ctx.fillStyle = 'rgba(255,255,255,0.14)';
         ctx.textAlign = 'center';
-        ctx.fillText('▲', width / 2, pad + fs);
-        ctx.fillText('▼', width / 2, height - pad);
+        // 左右スワイプヒント（両サイド端）
         ctx.textAlign = 'left';
-        ctx.fillText('◀', pad, height / 2);
+        ctx.fillText('◀ swipe', 10, height / 2);
         ctx.textAlign = 'right';
-        ctx.fillText('▶', width - pad, height / 2);
+        ctx.fillText('swipe ▶', width - 10, height / 2);
+        // ダブルタップヒント（GET_OUT/WAITINGのみ）
+        if (gameState === STATES.GET_OUT || gameState === STATES.WAITING) {
+            ctx.textAlign = 'center';
+            ctx.fillText('double tap = dive', width / 2, height * 0.10);
+        }
         ctx.restore();
     }
 
     // ── コンテキスト別 Space ボタン ──
     const bw = Math.min(230, width * 0.55);
-    const bh = 62;
+    const bh = Math.max(52, Math.min(68, height * 0.092));
     const bx = width / 2 - bw / 2;
     let btn = null;
 
     if (gameState === STATES.SPOT_SELECT) {
-        btn = { x: bx, y: height - beachHeight - 100, w: bw, h: bh,
-                label: 'SPACE / タップ でスタート', color: '#22AA55' };
+        btn = { x: bx, y: height - beachHeight - bh - 16, w: bw, h: bh,
+                label: 'START !', color: '#22AA55' };
     } else if (gameState === STATES.BEACH) {
-        btn = { x: bx, y: height - beachHeight - 100, w: bw, h: bh,
+        btn = { x: bx, y: height - beachHeight - bh - 16, w: bw, h: bh,
                 label: 'パドルアウト！', color: '#2288CC' };
     } else if (gameState === STATES.WAITING && _canCatch) {
         btn = { x: bx, y: height * 0.70, w: bw, h: bh,
@@ -910,7 +1018,7 @@ function drawTouchUI() {
     } else if (gameState === STATES.TAKEOFF_TRY) {
         // テイクオフは大型の専用ボタン
         const tbw = Math.min(300, width * 0.68);
-        const tbh = 86;
+        const tbh = Math.max(70, Math.min(92, height * 0.12));
         btn = { x: width / 2 - tbw / 2, y: height * 0.80, w: tbw, h: tbh,
                 label: 'TAKE OFF !', color: '#FF4400', large: true };
     }
@@ -1063,6 +1171,7 @@ function drawPaddleBars() {
     ctx.setLineDash([]);
 
     // ─ 判定パッド ─
+    const padR    = Math.max(36, Math.min(55, width * 0.12));
     const padData = [{ x: laneL, lane: -1, key: '←' }, { x: laneR, lane: 1, key: '→' }];
     for (const pd of padData) {
         const matchBar = ctwBars.find(b => b.lane === pd.lane && b.padFlash > 0);
@@ -1070,17 +1179,18 @@ function drawPaddleBars() {
         const ok       = matchBar ? matchBar.padSuccess : false;
 
         ctx.beginPath();
-        ctx.arc(pd.x, judgmentY, 30, 0, Math.PI * 2);
+        ctx.arc(pd.x, judgmentY, padR, 0, Math.PI * 2);
         ctx.fillStyle   = flashing ? (ok ? 'rgba(0,255,136,0.92)' : 'rgba(255,68,68,0.92)')
                                    : 'rgba(244,208,63,0.22)';
         ctx.fill();
         ctx.strokeStyle = flashing ? (ok ? '#00FF88' : '#FF4444') : '#F4D03F';
         ctx.lineWidth   = 3; ctx.stroke();
 
+        const arrowFS = Math.max(18, Math.min(26, padR * 0.58));
         ctx.fillStyle = 'white';
-        ctx.font      = 'bold 19px Arial';
+        ctx.font      = `bold ${arrowFS}px Arial`;
         ctx.textAlign = 'center';
-        ctx.fillText(pd.key, pd.x, judgmentY + 7);
+        ctx.fillText(pd.key, pd.x, judgmentY + arrowFS * 0.36);
     }
 
     // ─ バー描画 ─
@@ -1123,7 +1233,7 @@ function drawPaddleBars() {
     ctx.fillStyle = 'rgba(255,255,255,0.75)';
     ctx.font      = '14px Courier New';
     ctx.textAlign = 'center';
-    ctx.fillText('← → でリズムよくパドリング！', width / 2, judgmentY + JUDGMENT_HALF_Y + 30);
+    ctx.fillText('◉ タップ or ← → でパドリング！', width / 2, judgmentY + JUDGMENT_HALF_Y + 30);
 }
 
 // ─── 描画: テイクオフバー（中央縦流れ）──────────────────────
@@ -1270,9 +1380,22 @@ function draw() {
 
     update(); // ← 波の状態が確定してから更新
 
-    // 背景
-    ctx.fillStyle = '#00BFFF'; ctx.fillRect(0, 0, width, height);
-    ctx.fillStyle = '#F4D03F'; ctx.fillRect(0, height - beachHeight, width, beachHeight);
+    // ── カメラ追従（サーファーを画面の45%位置に）──
+    if (WORLD_W > width) {
+        const _tgt = Math.max(0, Math.min(WORLD_W - width, surferX - width * 0.45));
+        camX += (_tgt - camX) * 0.10;
+        camX  = Math.max(0, Math.min(WORLD_W - width, camX));
+    } else {
+        camX = 0;
+    }
+
+    // ── ワールド描画（カメラトランスフォーム適用）──
+    ctx.save();
+    ctx.translate(-Math.round(camX), 0);
+
+    // 背景・ビーチ
+    ctx.fillStyle = '#00BFFF'; ctx.fillRect(0, 0, WORLD_W, height);
+    ctx.fillStyle = '#F4D03F'; ctx.fillRect(0, height - beachHeight, WORLD_W, beachHeight);
 
     // 全波描画
     for (const wave of waves) drawWave(wave);
@@ -1286,8 +1409,6 @@ function draw() {
         else if (gameState === STATES.RIDING)                                              imgKey = 'RIDING';
         else if (gameState === STATES.PADDLING_TRY || gameState === STATES.CATCH_THE_WAVE) imgKey = 'FRONT';
         else {
-            // 波の面（弧より下かつ波底より上）にいる場合のみ正面
-            // 沖側（弧より上）は空洞・裏面ともにすべて BACK
             for (const wave of waves) {
                 const _d = Math.abs(surferX - wave.centerX);
                 if (wave.width > 0 && _d < wave.width / 2) {
@@ -1337,6 +1458,8 @@ function draw() {
             ctx.fillText('!', surferX, surferY - 32);
         }
     }
+
+    ctx.restore(); // ── ワールド描画終了（以降はスクリーン座標）──
 
     // BEACH 操作説明
     if (gameState === STATES.BEACH) {

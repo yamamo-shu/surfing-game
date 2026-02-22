@@ -174,6 +174,8 @@ let bestScore         = 0;
 let scoreMessage      = '';
 let rideComment       = '';     // ライド終了時の褒めコメント
 let rideEndedOnBeach  = false;  // ビーチ到達でライド終了したか
+let lastRideSpeed     = 2.0;    // 直前のライドの初速（スコア画面表示用）
+let scoreLockUntil    = 0;      // SCORE_DISPLAY 入力受付開始時刻（ms）
 
 // ワイプアウト
 let wipeoutTimer     = 0;
@@ -243,9 +245,9 @@ function _onTouchStart(e) {
     for (const t of e.changedTouches) {
         const sx = t.clientX, sy = t.clientY; // スクリーン座標
 
-        // SCORE_DISPLAY: どこでもタップで続行
+        // SCORE_DISPLAY: 3秒ロック解除後にタップで続行
         if (gameState === STATES.SCORE_DISPLAY) {
-            keysJustPressed.add('Space');
+            if (Date.now() >= scoreLockUntil) keysJustPressed.add('Space');
             _touchMap.set(t.identifier, null);
             continue;
         }
@@ -331,7 +333,8 @@ function _onTouchMove(e) {
                 newDir = dx < 0 ? 'ArrowLeft' : 'ArrowRight';
             } else if (dy > thr) {
                 newDir = 'ArrowDown';
-                // 上方向ドラッグは使わない（ダックダイブ=ダブルタップ）
+            } else if (dy < -thr && gameState === STATES.WAITING) {
+                newDir = 'ArrowUp'; // 波待ち中のみ上スワイプで前進
             }
             if (newDir !== _dragDirKey) {
                 if (_dragDirKey) keys[_dragDirKey] = false;
@@ -464,6 +467,8 @@ function endRiding() {
     // ビーチ到達か否かを記憶（SCORE_DISPLAY 後の遷移先判断用）
     rideEndedOnBeach = surferY > height - beachHeight;
     if (rideEndedOnBeach) surferY = height - beachHeight - 40;
+    lastRideSpeed  = rideSpeed;        // スコア画面表示用に保存
+    scoreLockUntil = Date.now() + 3000; // 3秒間入力ロック
     gameState  = STATES.SCORE_DISPLAY;
     slowFactor = 1.0;
     distText.innerText = '';
@@ -915,8 +920,8 @@ function update() {
         if (surferY > height - beachHeight || rideEnergy <= 0) endRiding();
 
     } else if (gameState === STATES.SCORE_DISPLAY) {
-        // 任意キーで GettingOut へ復帰
-        if (keysJustPressed.size > 0) {
+        // 3秒ロック解除後に任意キーで GettingOut へ復帰
+        if (keysJustPressed.size > 0 && Date.now() >= scoreLockUntil) {
             gameState = rideEndedOnBeach ? STATES.BEACH : STATES.GET_OUT;
         }
     }
@@ -1111,41 +1116,63 @@ function drawScoreResult() {
     if (gameState !== STATES.SCORE_DISPLAY) return;
     ctx.save();
     // 半透明オーバーレイ
-    ctx.fillStyle = 'rgba(0,0,20,0.74)';
+    ctx.fillStyle = 'rgba(0,0,20,0.82)';
     ctx.fillRect(0, 0, width, height);
     ctx.textAlign = 'center';
     const t = Date.now();
 
-    // スコアメッセージ（パルス）
+    // ─ スコアメッセージ（パルス）─
     const pulse    = 1 + 0.055 * Math.sin(t / 200);
     const msgColor = lastScore >= 300 ? '#FF6633'
                    : lastScore >= 200 ? '#F4D03F'
                    : lastScore >= 100 ? '#44FF88'
                    : lastScore >= 50  ? '#44AAFF'
                    :                    '#87CEEB';
-    ctx.font       = `bold italic ${Math.round(52 * pulse)}px 'Courier New'`;
+    const msgFS    = Math.round(Math.min(52, width * 0.11) * pulse);
+    ctx.font       = `bold italic ${msgFS}px 'Courier New'`;
     ctx.shadowColor = msgColor; ctx.shadowBlur = 24;
     ctx.fillStyle  = msgColor;
-    ctx.fillText(scoreMessage, width / 2, height / 2 - 120);
+    ctx.fillText(scoreMessage, width / 2, height * 0.20);
 
-    // 距離数値（最大表示）
-    ctx.font       = "bold 108px 'Courier New'";
+    // ─ 距離数値（大表示、レスポンシブ）─
+    const distFS   = Math.min(96, Math.round(width * 0.21));
+    ctx.font       = `bold ${distFS}px 'Courier New'`;
     ctx.shadowColor = 'white'; ctx.shadowBlur = 32;
     ctx.fillStyle  = 'white';
-    ctx.fillText(`${lastScore} m`, width / 2, height / 2 + 20);
+    ctx.fillText(`${lastScore} m`, width / 2, height * 0.20 + distFS * 1.15);
 
-    // 褒めコメント
-    ctx.font       = "20px 'Courier New'";
+    // ─ Wave パワー + 初速 ─
+    const powerLevel = Math.min(10, Math.max(1, Math.round((lastRideSpeed - 1.0) / 3.0 * 9) + 1));
+    const stars      = '★'.repeat(powerLevel) + '☆'.repeat(10 - powerLevel);
+    const powerColor = powerLevel <= 3 ? '#44AAFF' : powerLevel <= 6 ? '#F4D03F' : '#FF6633';
+    const infoY      = height * 0.20 + distFS * 1.15 + Math.min(52, width * 0.11) + 12;
+    ctx.shadowBlur   = 10;
+    ctx.shadowColor  = powerColor;
+    ctx.fillStyle    = powerColor;
+    ctx.font         = `bold ${Math.min(20, width * 0.046)}px 'Courier New'`;
+    ctx.fillText(`Wave Lv.${powerLevel}  ${stars}`, width / 2, infoY);
+    ctx.shadowBlur   = 0;
+    ctx.fillStyle    = 'rgba(255,255,255,0.75)';
+    ctx.font         = `${Math.min(16, width * 0.038)}px 'Courier New'`;
+    ctx.fillText(`初速 ${lastRideSpeed.toFixed(1)} px/f`, width / 2, infoY + Math.min(26, width * 0.058));
+
+    // ─ 褒めコメント ─
+    const commentY = infoY + Math.min(26, width * 0.058) + Math.min(40, height * 0.06);
+    ctx.font       = `${Math.min(18, width * 0.042)}px 'Courier New'`;
     ctx.shadowColor = 'rgba(0,0,0,0.8)'; ctx.shadowBlur = 8;
     ctx.fillStyle  = 'rgba(255,255,255,0.88)';
-    ctx.fillText(rideComment, width / 2, height / 2 + 80);
+    ctx.fillText(rideComment, width / 2, commentY);
 
-    // 点滅する「Press any key」
-    if (Math.floor(t / 500) % 2 === 0) {
-        ctx.font      = '15px Courier New';
-        ctx.shadowBlur = 0;
+    // ─ 入力ロック中カウントダウン / 解除後「Press any key」─
+    const remaining = scoreLockUntil - t;
+    ctx.shadowBlur  = 0;
+    ctx.font        = `${Math.min(15, width * 0.036)}px Courier New`;
+    if (remaining > 0) {
+        ctx.fillStyle = 'rgba(255,255,255,0.4)';
+        ctx.fillText(`${Math.ceil(remaining / 1000)} 秒後に続行できます`, width / 2, commentY + Math.min(60, height * 0.09));
+    } else if (Math.floor(t / 500) % 2 === 0) {
         ctx.fillStyle = 'rgba(255,255,255,0.55)';
-        ctx.fillText('Press any key to continue', width / 2, height / 2 + 145);
+        ctx.fillText('タップ / Press any key to continue', width / 2, commentY + Math.min(60, height * 0.09));
     }
     ctx.shadowBlur = 0;
     ctx.restore();

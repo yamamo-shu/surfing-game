@@ -286,10 +286,14 @@ function _onTouchStart(e) {
             continue;
         }
 
-        // TAKEOFF_TRY: TAKE OFF ボタン
-        if (gameState === STATES.TAKEOFF_TRY && _inRect(_spaceBtn, sx, sy)) {
-            keysJustPressed.add('Space');
+        // TAKEOFF_TRY: 中央の判定円を直接タップ
+        if (gameState === STATES.TAKEOFF_TRY) {
+            const tX = width / 2;
+            const tY = height * JUDGMENT_Y_RATIO;
+            const R  = Math.max(55, width * 0.14);
+            if (Math.hypot(sx - tX, sy - tY) <= R) keysJustPressed.add('Space');
             _touchMap.set(t.identifier, null);
+            _touchPos.set(t.identifier, {x: sx, y: sy});
             continue;
         }
 
@@ -318,20 +322,22 @@ function _onTouchMove(e) {
         if (!last) { _touchPos.set(t.identifier, {x: sx, y: sy}); continue; }
 
         const dx = sx - last.x, dy = sy - last.y;
-
-        // 直前のドラッグキーを解除してから新しい方向を適用
-        if (_dragDirKey) { keys[_dragDirKey] = false; }
-        _dragDirKey = null;
-
         const thr = 5;
+
+        // しきい値を超えた場合のみ方向を更新（超えない間は押しっぱなし維持）
         if (Math.abs(dx) > thr || Math.abs(dy) > thr) {
+            let newDir = null;
             if (Math.abs(dx) >= Math.abs(dy)) {
-                _dragDirKey = dx < 0 ? 'ArrowLeft' : 'ArrowRight';
+                newDir = dx < 0 ? 'ArrowLeft' : 'ArrowRight';
             } else if (dy > thr) {
-                _dragDirKey = 'ArrowDown';
+                newDir = 'ArrowDown';
                 // 上方向ドラッグは使わない（ダックダイブ=ダブルタップ）
             }
-            if (_dragDirKey) keys[_dragDirKey] = true;
+            if (newDir !== _dragDirKey) {
+                if (_dragDirKey) keys[_dragDirKey] = false;
+                _dragDirKey = newDir;
+                if (_dragDirKey) keys[_dragDirKey] = true;
+            }
         }
         _touchPos.set(t.identifier, {x: sx, y: sy});
     }
@@ -1015,12 +1021,6 @@ function drawTouchUI() {
     } else if (gameState === STATES.WAITING && _canCatch) {
         btn = { x: bx, y: height * 0.70, w: bw, h: bh,
                 label: '乗る！  CATCH!', color: '#FF8800' };
-    } else if (gameState === STATES.TAKEOFF_TRY) {
-        // テイクオフは大型の専用ボタン
-        const tbw = Math.min(300, width * 0.68);
-        const tbh = Math.max(70, Math.min(92, height * 0.12));
-        btn = { x: width / 2 - tbw / 2, y: height * 0.80, w: tbw, h: tbh,
-                label: 'TAKE OFF !', color: '#FF4400', large: true };
     }
 
     if (btn) {
@@ -1256,20 +1256,22 @@ function drawTakeoffBar() {
     ctx.setLineDash([]);
 
     // 判定パッド（中央）
+    const padR  = Math.max(36, Math.min(55, width * 0.12));
     const inJ   = Math.abs(bar.y - judgmentY) <= JUDGMENT_HALF_Y;
     const flash = bar.flashTimer > 0;
     ctx.beginPath();
-    ctx.arc(laneX, judgmentY, 34, 0, Math.PI * 2);
+    ctx.arc(laneX, judgmentY, padR, 0, Math.PI * 2);
     ctx.fillStyle   = flash ? (bar.flashSuccess ? 'rgba(0,255,136,0.92)' : 'rgba(255,68,68,0.92)')
                             : (inJ ? 'rgba(255,140,0,0.5)' : 'rgba(244,208,63,0.2)');
     ctx.fill();
     ctx.strokeStyle = flash ? (bar.flashSuccess ? '#00FF88' : '#FF4444') : '#F4D03F';
     ctx.lineWidth   = 3; ctx.stroke();
 
+    const circFS = Math.max(11, Math.min(14, padR * 0.30));
     ctx.fillStyle = 'white';
-    ctx.font      = 'bold 12px Courier New';
+    ctx.font      = `bold ${circFS}px Courier New`;
     ctx.textAlign = 'center';
-    ctx.fillText('SPACE', laneX, judgmentY + 5);
+    ctx.fillText('TAP!', laneX, judgmentY + circFS * 0.4);
 
     // バー本体
     let barColor = '#FF8C00';
@@ -1282,12 +1284,12 @@ function drawTakeoffBar() {
     ctx.fillStyle = '#fff';
     ctx.font      = 'bold 17px Courier New';
     ctx.textAlign = 'center';
-    ctx.fillText('SPACE!', laneX, bar.y + 7);
+    ctx.fillText('TAP!', laneX, bar.y + 7);
 
     // 操作説明
     ctx.fillStyle = 'rgba(255,255,255,0.75)';
     ctx.font      = '14px Courier New';
-    ctx.fillText('タイミングよく SPACE !', width / 2, judgmentY + JUDGMENT_HALF_Y + 30);
+    ctx.fillText('◉ タップ or SPACE でテイクオフ！', width / 2, judgmentY + JUDGMENT_HALF_Y + 30);
 }
 
 // ─── 描画: Catch the Wave フラッシュ ─────────────────────────

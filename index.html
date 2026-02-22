@@ -916,9 +916,10 @@ function update() {
         updateTakeoffTry();
 
     } else if (gameState === STATES.RIDING) {
-        // 縦: 波に押されて岸へ（操作不可）
-        surferY        += rideSpeed;
-        ridingDistance += rideSpeed;
+        // 縦: 乗った波の速さより少し速く岸へ（波から離れないよう追従）
+        const _waveSpd  = activeWave ? activeWave.speed : WAVE_SPEED;
+        surferY        += _waveSpd + 0.5; // 波速 + 0.5px/f で波に乗り続ける
+        ridingDistance += rideSpeed;      // スコアは波パワー（rideSpeed）基準
         rideEnergy--;
 
         // 横: 左右キーでバジェット消費 + X軸移動距離も加算

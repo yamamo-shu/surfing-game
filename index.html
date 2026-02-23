@@ -245,10 +245,98 @@ function _inRect(r, tx, ty) {
     return r && tx >= r.x && tx <= r.x + r.w && ty >= r.y && ty <= r.y + r.h;
 }
 
+// ─── 海の音（Web Audio API / 手続き生成）────────────────────────
+let _audioCtx    = null;
+let _oceanMaster = null;
+let _oceanMuted  = false;
+let _soundBtn    = null; // ミュートボタン領域
+
+function _initOcean() {
+    if (_audioCtx) {
+        if (_audioCtx.state === 'suspended') _audioCtx.resume();
+        return;
+    }
+    try {
+        _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const sr = _audioCtx.sampleRate;
+
+        // ─ ピンクノイズバッファ（8秒ループ×2ch）─
+        const bufLen = sr * 8;
+        const buf    = _audioCtx.createBuffer(2, bufLen, sr);
+        for (let ch = 0; ch < 2; ch++) {
+            const d = buf.getChannelData(ch);
+            let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0;
+            for (let i = 0; i < bufLen; i++) {
+                const w = Math.random() * 2 - 1;
+                b0=0.99886*b0+w*0.0555179; b1=0.99332*b1+w*0.0750759;
+                b2=0.96900*b2+w*0.1538520; b3=0.86650*b3+w*0.3104856;
+                b4=0.55000*b4+w*0.5329522; b5=-0.7616*b5-w*0.0168980;
+                d[i] = (b0+b1+b2+b3+b4+b5+w*0.5362) * 0.11;
+            }
+        }
+        const src = _audioCtx.createBufferSource();
+        src.buffer = buf; src.loop = true;
+
+        // ─ ローパスフィルター（高域を削って波っぽく）─
+        const lpf = _audioCtx.createBiquadFilter();
+        lpf.type = 'lowpass'; lpf.frequency.value = 650; lpf.Q.value = 0.4;
+
+        // ─ 高域シェルフカット（シャリシャリ感を除去）─
+        const shelf = _audioCtx.createBiquadFilter();
+        shelf.type = 'highshelf'; shelf.frequency.value = 1100; shelf.gain.value = -14;
+
+        // ─ 波ゲイン（LFOで「ザザー」リズムを作る）─
+        // base=0.18, lfo1=±0.12, lfo2=±0.06 → ゲインは 0〜0.36 で揺れる
+        const waveGain = _audioCtx.createGain();
+        waveGain.gain.value = 0.18;
+
+        // LFO1: 主波リズム（約7.7秒周期 = 0.13Hz）
+        const lfo1 = _audioCtx.createOscillator();
+        lfo1.type = 'sine'; lfo1.frequency.value = 0.13;
+        const lg1  = _audioCtx.createGain(); lg1.gain.value = 0.12;
+
+        // LFO2: 自然なゆらぎ（約12.5秒周期 = 0.08Hz）
+        const lfo2 = _audioCtx.createOscillator();
+        lfo2.type = 'sine'; lfo2.frequency.value = 0.08;
+        const lg2  = _audioCtx.createGain(); lg2.gain.value = 0.06;
+
+        // ─ マスターゲイン（フェードイン）─
+        _oceanMaster = _audioCtx.createGain();
+        _oceanMaster.gain.setValueAtTime(0, _audioCtx.currentTime);
+        _oceanMaster.gain.linearRampToValueAtTime(0.85, _audioCtx.currentTime + 3.0);
+
+        // ─ 接続 ─
+        src.connect(lpf); lpf.connect(shelf); shelf.connect(waveGain);
+        waveGain.connect(_oceanMaster); _oceanMaster.connect(_audioCtx.destination);
+        lfo1.connect(lg1); lg1.connect(waveGain.gain);
+        lfo2.connect(lg2); lg2.connect(waveGain.gain);
+
+        src.start(); lfo1.start(); lfo2.start();
+    } catch(e) { _audioCtx = null; }
+}
+
+function _toggleOceanMute() {
+    if (!_oceanMaster) return;
+    _oceanMuted = !_oceanMuted;
+    _oceanMaster.gain.cancelScheduledValues(_audioCtx.currentTime);
+    _oceanMaster.gain.setTargetAtTime(
+        _oceanMuted ? 0 : 0.85,
+        _audioCtx.currentTime, 0.3
+    );
+}
+
 function _onTouchStart(e) {
     e.preventDefault();
+    _initOcean(); // 初回タッチで海の音を開始（ブラウザ制限対策）
     for (const t of e.changedTouches) {
         const sx = t.clientX, sy = t.clientY; // スクリーン座標
+
+        // ミュートボタン
+        if (_inRect(_soundBtn, sx, sy)) {
+            _toggleOceanMute();
+            _touchMap.set(t.identifier, null);
+            continue;
+        }
 
         // 「戻る」ボタン（SPOT_SELECT 以外で表示）
         if (gameState !== STATES.SPOT_SELECT && _inRect(_backBtn, sx, sy)) {
@@ -1176,6 +1264,25 @@ function drawTouchUI() {
         ctx.font        = `bold ${Math.max(12, Math.min(15, bbH * 0.40))}px 'Courier New'`;
         ctx.textAlign   = 'center';
         ctx.fillText('◀ 戻る', bbX + bbW / 2, bbY + bbH * 0.66);
+        ctx.restore();
+    }
+
+    // ── サウンドボタン（右下・常時表示）──
+    {
+        const sbW = Math.max(44, Math.min(60, width * 0.13));
+        const sbH = Math.max(34, Math.min(44, height * 0.058));
+        const sbX = width - sbW - 12;
+        const sbY = height - sbH - 10;
+        _soundBtn = { x: sbX, y: sbY, w: sbW, h: sbH };
+        ctx.save();
+        ctx.fillStyle   = _oceanMuted ? 'rgba(80,0,0,0.65)' : 'rgba(0,0,0,0.55)';
+        ctx.strokeStyle = _oceanMuted ? 'rgba(255,80,80,0.5)' : 'rgba(255,255,255,0.35)';
+        ctx.lineWidth   = 1.5;
+        ctx.beginPath(); ctx.roundRect(sbX, sbY, sbW, sbH, 8); ctx.fill(); ctx.stroke();
+        ctx.fillStyle   = _oceanMuted ? 'rgba(255,100,100,0.9)' : 'rgba(255,255,255,0.75)';
+        ctx.font        = `bold ${Math.max(12, Math.min(15, sbH * 0.40))}px 'Courier New'`;
+        ctx.textAlign   = 'center';
+        ctx.fillText(_oceanMuted ? '音 OFF' : '音 ON', sbX + sbW / 2, sbY + sbH * 0.66);
         ctx.restore();
     }
 }
